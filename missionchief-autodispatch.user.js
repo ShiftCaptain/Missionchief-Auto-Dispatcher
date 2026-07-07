@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.2.0
+// @version      0.4.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -353,24 +353,56 @@
     }
 
     // ── Dispatch logic (the fixed, delta-based version) ──────────────────────
+    // States 1 (at station) and 2 (available via radio) are both legitimately
+    // dispatchable. The real guard against double-dispatch / unwanted
+    // "follow-up" assignments is checking the vehicle has NO current
+    // commitment at all — no active mission target and nothing queued.
     const AVAILABLE_STATES = new Set([1, 2]);
 
     function getAvailableVehicles(vehicles) {
-        return vehicles.filter((v) => AVAILABLE_STATES.has(v.fms_real ?? v.fms_show));
+        return vehicles.filter((v) =>
+            AVAILABLE_STATES.has(v.fms_real ?? v.fms_show)
+            && !(v.target_type === 'mission' && v.target_id) // not already assigned to a mission
+            && !v.queued_mission_id // nothing already queued as a follow-up
+        );
     }
 
     // Counts vehicles CURRENTLY assigned to this mission via target_type/target_id —
     // the real source of truth, confirmed against live vehicle data. This is what
     // replaces the old "skip mission if vehicle_state != 0" behavior that caused
     // partial dispatches and upgrades to get silently abandoned.
+    // Returns both the per-type counts AND the set of vehicle IDs counted, so
+    // callers can merge in additional sources without double-counting.
     function getAssignedVehicleCounts(missionId, vehicles) {
         const counts = {};
+        const ids = new Set();
         for (const v of vehicles) {
             if (v.target_type === 'mission' && v.target_id === missionId) {
                 counts[v.vehicle_type] = (counts[v.vehicle_type] || 0) + 1;
+                ids.add(v.id);
             }
         }
-        return counts;
+        return { counts, ids };
+    }
+
+    // Some mission upgrades (e.g. Little Field Fire -> Large Field Fire) appear
+    // to issue a NEW mission id for what is physically the same call at the same
+    // address. When that happens, vehicles already working it still point their
+    // target_id at the OLD id, so a lookup keyed on the current id finds nothing
+    // and the bot treats it as a brand-new mission — dispatching the full
+    // requirement set on top of units that are already there.
+    //
+    // Fix: track commitment by LOCATION (which an upgrade doesn't change) as a
+    // second layer alongside the live target_id check. Any vehicle we previously
+    // saw committed to this location, that's still busy (not back in the
+    // available pool), gets folded into the assigned counts even if its
+    // target_id no longer matches the mission's current id.
+    const missionTrack = {}; // signature -> Set of vehicle ids last known committed here
+
+    function missionSignature(mission) {
+        const lat = (mission.latitude || 0).toFixed(5);
+        const lon = (mission.longitude || 0).toFixed(5);
+        return `${lat},${lon}`;
     }
 
     function getRequiredVehicleTypes(entry, links, assignedCounts) {
@@ -421,6 +453,8 @@
         const available = getAvailableVehicles(vehicles);
         log(`  ${missions.length} active missions | ${available.length} vehicles available`);
 
+        const vehicleById = new Map(vehicles.map((v) => [v.id, v]));
+
         const ignoreList = getIgnoreList().map((n) => n.toLowerCase());
         missions = missions.filter((m) => !ignoreList.includes((m.caption || '').toLowerCase()));
 
@@ -445,6 +479,7 @@
             const mlon = mission.longitude || 0;
             const mid = mission.id;
             const mtid = String(mission.mtid ?? mission.mission_type_id ?? '');
+            const sig = missionSignature(mission);
 
             let entry = missionReqs[mtid];
             if (!mtid || !entry) {
@@ -460,8 +495,26 @@
                 }
             }
 
-            // Delta: what's already assigned to THIS mission, per vehicle type
-            const assignedCounts = getAssignedVehicleCounts(mid, vehicles);
+            // Delta: what's already assigned to THIS mission, per vehicle type —
+            // live target_id matches first...
+            const assigned = getAssignedVehicleCounts(mid, vehicles);
+
+            // ...then fold in anything previously tracked at this LOCATION that's
+            // still busy but whose target_id fell out of sync (the upgrade case).
+            const tracked = missionTrack[sig];
+            if (tracked) {
+                for (const vid of tracked) {
+                    if (assigned.ids.has(vid)) continue; // already counted, don't double-count
+                    const v = vehicleById.get(vid);
+                    if (v && !AVAILABLE_STATES.has(v.fms_real ?? v.fms_show)) {
+                        assigned.counts[v.vehicle_type] = (assigned.counts[v.vehicle_type] || 0) + 1;
+                        assigned.ids.add(vid);
+                    }
+                }
+            }
+            const assignedCounts = assigned.counts;
+            missionTrack[sig] = new Set(assigned.ids);
+
             const slots = getRequiredVehicleTypes(entry, state.links, assignedCounts);
 
             const patients = mission.patients_count || 0;
@@ -508,6 +561,7 @@
 
             const success = await dispatchVehicles(mid, selectedIds);
             if (success) {
+                selectedIds.forEach((id) => missionTrack[sig].add(id));
                 log(unfilled > 0
                     ? `  PART  ${name} [type ${mtid}] -> ${selectedIds.length} vehicle(s) (${unfilled} slot(s) unfilled, will retry)`
                     : `  SENT  ${name} [type ${mtid}] -> ${selectedIds.length} vehicle(s)`);
