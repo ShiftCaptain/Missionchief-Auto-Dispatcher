@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.4.0
+// @version      0.4.1
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -548,10 +548,23 @@
             }
 
             const selectedIds = [];
+            const selectedNames = [];
             let unfilled = 0;
             for (const acceptableTypes of slots) {
                 const v = nearestVehicleForSlot(available, acceptableTypes, mlat, mlon, usedIds, state.buildingCoords);
-                if (!v) { unfilled++; } else { selectedIds.push(v.id); usedIds.add(v.id); }
+                if (!v) {
+                    unfilled++;
+                } else {
+                    selectedIds.push(v.id);
+                    usedIds.add(v.id);
+                    // Capture status at the moment of selection — if a follow-up
+                    // shows up later in-game, compare that vehicle's name here
+                    // against what its fms/target/queued fields looked like
+                    // right before we dispatched it.
+                    selectedNames.push(
+                        `${v.caption || v.id} (fms=${v.fms_real ?? v.fms_show}, target=${v.target_type || 'none'}/${v.target_id ?? '-'}, queued=${v.queued_mission_id ?? '-'})`
+                    );
+                }
             }
 
             if (!selectedIds.length) {
@@ -565,6 +578,7 @@
                 log(unfilled > 0
                     ? `  PART  ${name} [type ${mtid}] -> ${selectedIds.length} vehicle(s) (${unfilled} slot(s) unfilled, will retry)`
                     : `  SENT  ${name} [type ${mtid}] -> ${selectedIds.length} vehicle(s)`);
+                selectedNames.forEach((n) => log(`         + ${n}`));
                 dispatchedCount++;
             } else {
                 log(`  FAIL  ${name} [type ${mtid}] (dispatch error)`);
