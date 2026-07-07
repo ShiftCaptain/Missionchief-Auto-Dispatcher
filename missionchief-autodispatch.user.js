@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.1.0
+// @version      0.2.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -52,9 +52,55 @@
     // ── Storage: vehicle-class links + mission requirement cache ────────────
     // Same schema as the Python bot's links.json and json/region/<server>/missions/<mtid>.json,
     // just persisted via GM storage instead of files on disk.
+
+    // Baked-in default vehicle class -> type ID mapping (ShiftCaptain's confirmed
+    // links.json, verified against a live fleet report covering all 19 owned
+    // vehicle types). Anyone installing this script fresh gets a working bot
+    // immediately; Import Cache can still override this per-user if their
+    // server's type IDs differ.
+    const DEFAULT_LINKS = {
+        "firetrucks": [0, 1, 30, 13, 18],
+        "platform trucks": [2, 13],
+        "wildland fire engines": [30, 31, 32, 33],
+        "battalion chief vehicles": [3, 12],
+        "heavy rescue vehicles": [4, 18, 8],
+        "ambulance": [5, 27],
+        "water tankers": [7],
+        "hazmat vehicles": [9],
+        "police cars": [10, 19, 26],
+        "mobile command vehicles": [12],
+        "mobile air vehicles": [6],
+        "k-9 units": [19],
+        "type 5 engine": [31],
+        "type 7 engine": [32],
+        "type 3 engine": [30],
+        "pumper tanker": [33],
+        "crew carrier": [34],
+        "mass casulty unit": [20],
+        "swat suv": [26],
+        "swat armoured vehicles": [16],
+        "swat personnel": [16, 26],
+        "police helicopters": [14],
+        "boats": [21, 22],
+        "large fire boats": [24],
+        "large rescue boat": [25],
+        "police bike": [23],
+        "ems chief": [29],
+        "ems rescue": [28],
+        "fly car": [15],
+        "air ambulance": [11],
+        "arff": [17],
+        "sheriff supervisor units": [47],
+        "prisoner transport": [87],
+    };
+
     function getLinks() {
         const raw = GM_getValue('mc_links', null);
-        return raw ? JSON.parse(raw) : {};
+        if (raw) return JSON.parse(raw);
+        // First run — seed storage from the baked-in defaults so the bot
+        // works immediately without requiring an Import Cache step.
+        setLinks(DEFAULT_LINKS);
+        return { ...DEFAULT_LINKS };
     }
     function setLinks(obj) {
         GM_setValue('mc_links', JSON.stringify(obj));
