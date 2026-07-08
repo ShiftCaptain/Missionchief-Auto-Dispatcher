@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.4.1
+// @version      0.6.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
 // @match        https://*.leitstellenspiel.de/*
+// @noframes
 // @downloadURL  https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/missionchief-autodispatch.user.js
 // @updateURL    https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/missionchief-autodispatch.user.js
 // @grant        GM_setValue
@@ -25,10 +26,58 @@
     };
 
     // ── Utilities ─────────────────────────────────────────────────────────
+    // log() is now console-only — the visible panel shows a structured
+    // mission status list instead (see upsertMissionRow below), matching
+    // MissionChief's own Radio panel look rather than a scrolling console.
     function log(msg) {
-        const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
-        console.log(line);
-        appendToPanelLog(line);
+        console.log(`[${new Date().toLocaleTimeString()}] ${msg}`);
+    }
+
+    // Status -> color used for both the badge and the status text
+    const STATUS_COLORS = {
+        dispatched: '#1565c0',   // blue — just sent vehicles
+        fullyStaffed: '#2e7d32', // green — nothing needed
+        missing: '#ef6c00',      // orange — partial, still short
+        noUnits: '#c62828',      // red — nothing available to send
+        failed: '#c62828',       // red — dispatch call itself failed
+        unknown: '#757575',      // gray — uncached/unknown mission type
+    };
+
+    const missionRowEls = new Map(); // key -> row element, persists across batches
+
+    function upsertMissionRow(key, title, statusText, colorKey) {
+        if (!rowsContainer) return;
+        const color = STATUS_COLORS[colorKey] || '#757575';
+        let row = missionRowEls.get(key);
+        if (!row) {
+            row = document.createElement('div');
+            row.style.cssText = `
+                all: unset; display: flex; align-items: center; gap: 8px;
+                padding: 6px 10px; border-bottom: 1px solid #eee;
+                font: 12px/1.3 Arial, Helvetica, sans-serif; box-sizing: border-box; width: 100%;
+            `;
+            row.innerHTML = `
+                <span class="mc-badge" style="all:unset; display:inline-block; width:10px; height:10px; border-radius:2px; flex-shrink:0;"></span>
+                <span class="mc-title" style="all:unset; flex:1 1 auto; color:#222; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+                <span class="mc-status" style="all:unset; flex-shrink:0; font-weight:bold; white-space:nowrap;"></span>
+            `;
+            rowsContainer.appendChild(row);
+            missionRowEls.set(key, row);
+        }
+        row.querySelector('.mc-badge').style.background = color;
+        row.querySelector('.mc-title').textContent = title;
+        const statusEl = row.querySelector('.mc-status');
+        statusEl.textContent = statusText;
+        statusEl.style.color = color;
+    }
+
+    function removeStaleMissionRows(activeKeys) {
+        for (const [key, el] of missionRowEls) {
+            if (!activeKeys.has(key)) {
+                el.remove();
+                missionRowEls.delete(key);
+            }
+        }
     }
 
     function haversineKm(lat1, lon1, lat2, lon2) {
@@ -470,6 +519,7 @@
 
         let dispatchedCount = 0;
         const usedIds = new Set();
+        const processedKeys = new Set();
 
         for (const mission of missions) {
             if (!isRunning) break;
@@ -480,6 +530,8 @@
             const mid = mission.id;
             const mtid = String(mission.mtid ?? mission.mission_type_id ?? '');
             const sig = missionSignature(mission);
+            const rowKey = String(mid);
+            processedKeys.add(rowKey);
 
             let entry = missionReqs[mtid];
             if (!mtid || !entry) {
@@ -487,10 +539,12 @@
                     entry = buildCacheEntry(mtid, state.einsaetze, state.links);
                     if (!entry) {
                         log(`  SKIP  ${name} [type ${mtid}] (unknown mission type)`);
+                        upsertMissionRow(rowKey, name, 'Unknown Type', 'unknown');
                         continue;
                     }
                 } else {
                     log(`  SKIP  ${name} [type ${mtid}] (not in cache)`);
+                    upsertMissionRow(rowKey, name, 'Not Cached', 'unknown');
                     continue;
                 }
             }
@@ -532,11 +586,15 @@
                 // No-requirement mission type — dispatch empty once.
                 // vehicle_state is safe to use ONLY here as a one-time marker,
                 // since there's nothing to ever top up on a no-req mission.
-                if ((mission.vehicle_state || 0) !== 0) continue;
+                if ((mission.vehicle_state || 0) !== 0) {
+                    upsertMissionRow(rowKey, name, 'Fully Staffed', 'fullyStaffed');
+                    continue;
+                }
                 const success = await dispatchVehicles(mid, []);
                 log(success
                     ? `  SENT  ${name} [type ${mtid}] -> 0 vehicle(s) (no requirements)`
                     : `  FAIL  ${name} [type ${mtid}] (dispatch error)`);
+                upsertMissionRow(rowKey, name, success ? 'Dispatched' : 'Failed', success ? 'dispatched' : 'failed');
                 if (success) dispatchedCount++;
                 await sleep(CONFIG.dispatchDelayMs);
                 continue;
@@ -544,6 +602,7 @@
 
             if (!slots.length) {
                 log(`  SKIP  ${name} [type ${mtid}] (fully staffed already)`);
+                upsertMissionRow(rowKey, name, 'Fully Staffed', 'fullyStaffed');
                 continue;
             }
 
@@ -569,6 +628,7 @@
 
             if (!selectedIds.length) {
                 log(`  SKIP  ${name} [type ${mtid}] (no available vehicles)`);
+                upsertMissionRow(rowKey, name, `Missing ${unfilled}`, 'noUnits');
                 continue;
             }
 
@@ -579,14 +639,21 @@
                     ? `  PART  ${name} [type ${mtid}] -> ${selectedIds.length} vehicle(s) (${unfilled} slot(s) unfilled, will retry)`
                     : `  SENT  ${name} [type ${mtid}] -> ${selectedIds.length} vehicle(s)`);
                 selectedNames.forEach((n) => log(`         + ${n}`));
+                upsertMissionRow(
+                    rowKey, name,
+                    unfilled > 0 ? `Dispatched (${selectedIds.length}), Missing ${unfilled}` : `Dispatched (${selectedIds.length})`,
+                    unfilled > 0 ? 'missing' : 'dispatched'
+                );
                 dispatchedCount++;
             } else {
                 log(`  FAIL  ${name} [type ${mtid}] (dispatch error)`);
+                upsertMissionRow(rowKey, name, 'Failed', 'failed');
             }
 
             await sleep(CONFIG.dispatchDelayMs);
         }
 
+        removeStaleMissionRows(processedKeys);
         log(`Batch complete — dispatched to ${dispatchedCount} mission(s).`);
     }
 
@@ -650,13 +717,7 @@
     }
 
     // ── UI panel ──────────────────────────────────────────────────────────
-    let logEl, statusEl, panelEl;
-
-    function appendToPanelLog(line) {
-        if (!logEl) return;
-        logEl.textContent += line + '\n';
-        logEl.scrollTop = logEl.scrollHeight;
-    }
+    let rowsContainer, statusEl, panelEl;
 
     function updateStatus() {
         if (!statusEl) return;
@@ -720,9 +781,8 @@
                 <button id="mc-stop" style="${btnStyle}">Stop</button>
                 <button id="mc-import" style="${btnStyle}">Import Cache</button>
             </div>
-            <textarea id="mc-log" readonly style="all:unset; display:block; box-sizing:border-box; width:100%;
-                 flex: 1 1 auto; min-height: 60px; background:#181818; color:#8fd68f; border:none;
-                 padding:8px; resize:none; font:11px/1.4 'Consolas','Courier New',monospace; white-space:pre-wrap; overflow-y:auto;"></textarea>
+            <div id="mc-rows" style="all:unset; display:block; box-sizing:border-box; width:100%;
+                 flex: 1 1 auto; min-height: 60px; background:#fff; overflow-y:auto;"></div>
             <div id="mc-resize" title="Drag to resize" style="position:absolute; right:2px; bottom:2px; width:14px; height:14px;
                  cursor: nwse-resize; background:
                  linear-gradient(135deg, transparent 0%, transparent 40%, #999 40%, #999 46%, transparent 46%,
@@ -731,7 +791,7 @@
         `;
         document.body.appendChild(panel);
 
-        logEl = panel.querySelector('#mc-log');
+        rowsContainer = panel.querySelector('#mc-rows');
         statusEl = panel.querySelector('#mc-status');
 
         panel.querySelector('#mc-start').addEventListener('click', start);
@@ -743,6 +803,32 @@
 
         setupDragging(panel, panel.querySelector('#mc-header'));
         setupResizing(panel, panel.querySelector('#mc-resize'));
+        setupPopupWatcher(panel);
+    }
+
+    // MissionChief's popups (station/vehicle detail pages, etc.) render inside
+    // an iframe overlaying the page. Since our panel is position:fixed with a
+    // high z-index, it would otherwise always sit on top of that popup. Rather
+    // than guess at the popup's exact markup, track how many iframes exist on
+    // page load as a baseline — any iframe count ABOVE that baseline means a
+    // popup opened, so we hide the panel until the count drops back down.
+    function setupPopupWatcher(panel) {
+        const baselineIframeCount = document.querySelectorAll('iframe').length;
+        let hidden = false;
+
+        function sync() {
+            const extra = document.querySelectorAll('iframe').length > baselineIframeCount;
+            if (extra && !hidden) {
+                panel.style.display = 'none';
+                hidden = true;
+            } else if (!extra && hidden) {
+                panel.style.display = 'flex';
+                hidden = false;
+            }
+        }
+
+        const observer = new MutationObserver(sync);
+        observer.observe(document.body, { childList: true, subtree: true });
     }
 
     function setupDragging(panel, handle) {
