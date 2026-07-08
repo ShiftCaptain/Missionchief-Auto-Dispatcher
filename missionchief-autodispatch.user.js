@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.6.0
+// @version      0.8.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -96,6 +96,24 @@
 
     function sleep(ms) {
         return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    // Same purpose as sleep(), but updates the panel's countdown timer each
+    // second and bails out immediately (rather than waiting out the full
+    // duration) if the bot is stopped mid-wait.
+    function sleepWithCountdown(totalMs) {
+        return new Promise((resolve) => {
+            const start = Date.now();
+            function tick() {
+                if (!isRunning) { resolve(); return; }
+                const remaining = Math.max(0, totalMs - (Date.now() - start));
+                const secs = Math.ceil(remaining / 1000);
+                setTimerText(remaining > 0 ? `Next batch in ${secs}s` : 'Starting batch...');
+                if (remaining <= 0) { resolve(); return; }
+                setTimeout(tick, 250);
+            }
+            tick();
+        });
     }
 
     // ── Storage: vehicle-class links + mission requirement cache ────────────
@@ -520,6 +538,7 @@
         let dispatchedCount = 0;
         const usedIds = new Set();
         const processedKeys = new Set();
+        const verifyQueue = []; // successful dispatches to double-check after the batch
 
         for (const mission of missions) {
             if (!isRunning) break;
@@ -645,12 +664,62 @@
                     unfilled > 0 ? 'missing' : 'dispatched'
                 );
                 dispatchedCount++;
+                // Don't fully trust this yet — a dispatch call can succeed but
+                // still land as a QUEUED follow-up rather than an immediate
+                // assignment if the vehicle wasn't truly free. Verify after
+                // the batch and walk it back if it didn't land immediately.
+                verifyQueue.push({ rowKey, sig, mid, name, mtid, ids: [...selectedIds], unfilledAtDispatch: unfilled });
             } else {
                 log(`  FAIL  ${name} [type ${mtid}] (dispatch error)`);
                 upsertMissionRow(rowKey, name, 'Failed', 'failed');
             }
 
             await sleep(CONFIG.dispatchDelayMs);
+        }
+
+        // ── Post-batch verification ──────────────────────────────────────
+        // Re-check every vehicle we just dispatched: did it actually land on
+        // THIS mission immediately, or did the game queue it as a follow-up
+        // for later? If it didn't land immediately, stop trusting it as
+        // committed so the next batch tries a different vehicle instead of
+        // assuming the slot is filled.
+        if (verifyQueue.length && isRunning) {
+            await sleep(2000); // give the game a moment to settle
+            try {
+                const recheck = await fetchVehicles();
+                const recheckById = new Map(recheck.map((v) => [v.id, v]));
+
+                for (const rec of verifyQueue) {
+                    const flagged = [];
+                    for (const id of rec.ids) {
+                        const v = recheckById.get(id);
+                        const landedImmediately = v && v.target_type === 'mission' && v.target_id === rec.mid;
+                        if (!landedImmediately) flagged.push({ id, v });
+                    }
+                    if (!flagged.length) continue;
+
+                    const track = missionTrack[rec.sig];
+                    if (track) flagged.forEach((f) => track.delete(f.id));
+
+                    flagged.forEach((f) => {
+                        const vv = f.v;
+                        const desc = vv
+                            ? `${vv.caption || f.id} (now target=${vv.target_type || 'none'}/${vv.target_id ?? '-'}, queued=${vv.queued_mission_id ?? '-'})`
+                            : `vehicle ${f.id} (not found on recheck)`;
+                        log(`  WARN  ${rec.name} [type ${rec.mtid}] -> ${desc} did NOT land immediately — treating as not dispatched`);
+                    });
+
+                    const confirmedCount = rec.ids.length - flagged.length;
+                    const totalMissing = rec.unfilledAtDispatch + flagged.length;
+                    upsertMissionRow(
+                        rec.rowKey, rec.name,
+                        confirmedCount > 0 ? `Dispatched (${confirmedCount}), Missing ${totalMissing}` : `Missing ${totalMissing}`,
+                        confirmedCount > 0 ? 'missing' : 'noUnits'
+                    );
+                }
+            } catch (e) {
+                log(`Network error during dispatch verification: ${e.message}`);
+            }
         }
 
         removeStaleMissionRows(processedKeys);
@@ -685,10 +754,12 @@
         let batchNum = 1;
         while (isRunning) {
             log(`-- Batch #${batchNum} --`);
+            setTimerText('Fetching missions & vehicles...');
             await runBatch();
 
             if (!isRunning) break;
             try {
+                setTimerText('Running transport passes...');
                 const freshVehicles = await fetchVehicles();
                 await runTransportPass(freshVehicles);
                 if (!isRunning) break;
@@ -699,9 +770,10 @@
 
             if (!isRunning) break;
             log(`Sleeping ${CONFIG.sleepPerBatchMs / 1000}s before next batch...`);
-            await sleep(CONFIG.sleepPerBatchMs);
+            await sleepWithCountdown(CONFIG.sleepPerBatchMs);
             batchNum++;
         }
+        setTimerText('Stopped');
         log('Stopped.');
     }
 
@@ -714,15 +786,21 @@
     function stop() {
         isRunning = false;
         updateStatus();
+        setTimerText('Stopped');
     }
 
     // ── UI panel ──────────────────────────────────────────────────────────
-    let rowsContainer, statusEl, panelEl;
+    let rowsContainer, statusEl, panelEl, timerEl;
 
     function updateStatus() {
         if (!statusEl) return;
         statusEl.textContent = isRunning ? 'RUNNING' : 'STOPPED';
         statusEl.style.color = isRunning ? '#7fffa0' : '#ffd1d1';
+    }
+
+    function setTimerText(text) {
+        if (!timerEl) return;
+        timerEl.textContent = text;
     }
 
     function getSavedRect() {
@@ -783,6 +861,9 @@
             </div>
             <div id="mc-rows" style="all:unset; display:block; box-sizing:border-box; width:100%;
                  flex: 1 1 auto; min-height: 60px; background:#fff; overflow-y:auto;"></div>
+            <div id="mc-timer" style="all:unset; display:block; box-sizing:border-box; width:100%;
+                 padding:5px 10px; background:#f2f2f2; border-top:1px solid #ddd; color:#555;
+                 font:11px/1.3 Arial, Helvetica, sans-serif; text-align:center; flex-shrink:0;">Idle</div>
             <div id="mc-resize" title="Drag to resize" style="position:absolute; right:2px; bottom:2px; width:14px; height:14px;
                  cursor: nwse-resize; background:
                  linear-gradient(135deg, transparent 0%, transparent 40%, #999 40%, #999 46%, transparent 46%,
@@ -793,6 +874,7 @@
 
         rowsContainer = panel.querySelector('#mc-rows');
         statusEl = panel.querySelector('#mc-status');
+        timerEl = panel.querySelector('#mc-timer');
 
         panel.querySelector('#mc-start').addEventListener('click', start);
         panel.querySelector('#mc-stop').addEventListener('click', stop);
