@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.11.0
+// @version      0.12.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -230,6 +230,77 @@
             }
         }
         return partners;
+    }
+
+    // Personnel certification & resource-need mappings: user-defined links
+    // from a certification/resource keyword (as it appears in the game's own
+    // missing_text field, e.g. "HazMat" or "foam") to a vehicle class from
+    // links.json whose crews/cargo are assumed to cover it. No defaults are
+    // guessed here — a wrong guess (e.g. assuming Heavy Rescue = Tech Rescue
+    // certified) could cause bad dispatches, so this starts empty until the
+    // user defines it themselves, same as Task Forces.
+    function getPersonnelMappings() {
+        const raw = GM_getValue('mc_personnelMappings', null);
+        return raw ? JSON.parse(raw) : [];
+    }
+    function setPersonnelMappings(arr) {
+        GM_setValue('mc_personnelMappings', JSON.stringify(arr));
+    }
+    function getResourceMappings() {
+        const raw = GM_getValue('mc_resourceMappings', null);
+        return raw ? JSON.parse(raw) : [];
+    }
+    function setResourceMappings(arr) {
+        GM_setValue('mc_resourceMappings', JSON.stringify(arr));
+    }
+    function findMappedVehicleClass(keyword, mappings) {
+        const lower = (keyword || '').toLowerCase();
+        const hit = mappings.find((m) =>
+            lower.includes(m.key.toLowerCase()) || m.key.toLowerCase().includes(lower)
+        );
+        return hit ? hit.vehicleClass : null;
+    }
+
+    // Parses mission.missing_text — a live, game-computed field reporting
+    // exactly what's still short, e.g.
+    // {"vehicles":"5 firetrucks","personnel":"4x HazMat","other":"200 gal. foam"}
+    // Note: the game uses real non-breaking spaces (\u00a0) between words.
+    function parseMissingText(mission) {
+        if (!mission.missing_text) return null;
+        try {
+            return JSON.parse(mission.missing_text);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // "4x HazMat, 6x Technical Rescuer" -> [{ qty: 4, cert: 'HazMat' }, ...]
+    function parsePersonnelNeeds(text) {
+        if (!text) return [];
+        return text
+            .split(',')
+            .map((s) => s.replace(/\u00a0/g, ' ').trim())
+            .filter(Boolean)
+            .map((tok) => {
+                const m = tok.match(/^(\d+)\s*x\s*(.+)$/i);
+                return m ? { qty: parseInt(m[1], 10), cert: m[2].trim() } : null;
+            })
+            .filter(Boolean);
+    }
+
+    // "200 gal. foam" -> [{ qty: 200, resource: 'foam', raw: '200 gal. foam' }]
+    function parseOtherNeeds(text) {
+        if (!text) return [];
+        return text
+            .split(',')
+            .map((s) => s.replace(/\u00a0/g, ' ').trim())
+            .filter(Boolean)
+            .map((tok) => {
+                const m = tok.match(/^([\d.]+)\s*(?:gal\.?|gallons?)?\s*(.+)$/i);
+                return m
+                    ? { qty: parseFloat(m[1]), resource: m[2].trim().toLowerCase(), raw: tok }
+                    : { qty: null, resource: tok.toLowerCase(), raw: tok };
+            });
     }
 
     // Scheduled/special missions (fire alarms, exercises, speed traps, drills,
@@ -584,6 +655,8 @@
             if (v.caption) availableByCaption.set(v.caption.toLowerCase(), v);
         }
         const taskForces = getTaskForces();
+        const personnelMappings = getPersonnelMappings();
+        const resourceMappings = getResourceMappings();
 
         const settings = getSettings();
         if (!settings.dispatchAllianceCalls) {
@@ -670,8 +743,37 @@
                 }
             }
 
+            // Personnel certifications & resources (water, foam, etc.): the game
+            // computes what's still short in missing_text — we can't calculate
+            // exact vehicle counts ourselves (no certification-per-employee or
+            // capacity-per-vehicle data exists), so this is reactive: send ONE
+            // more matching vehicle per batch per still-open shortfall, and let
+            // the game's own next missing_text tell us if that was enough.
+            const missing = parseMissingText(mission);
+            const resourceNotes = [];
+            if (missing && personnelMappings.length) {
+                for (const need of parsePersonnelNeeds(missing.personnel)) {
+                    const cls = findMappedVehicleClass(need.cert, personnelMappings);
+                    const typeIds = cls ? state.links[cls] : null;
+                    if (typeIds && typeIds.length) {
+                        slots.push(typeIds);
+                        resourceNotes.push(`personnel: ${need.qty}x ${need.cert} still needed -> +1 ${cls}`);
+                    }
+                }
+            }
+            if (missing && resourceMappings.length) {
+                for (const need of parseOtherNeeds(missing.other)) {
+                    const cls = findMappedVehicleClass(need.resource, resourceMappings);
+                    const typeIds = cls ? state.links[cls] : null;
+                    if (typeIds && typeIds.length) {
+                        slots.push(typeIds);
+                        resourceNotes.push(`other: ${need.raw} still needed -> +1 ${cls}`);
+                    }
+                }
+            }
+
             const totalRequired = (entry.requirements || []).reduce((s, r) => s + parseInt(r.qty, 10), 0);
-            if (totalRequired === 0 && !patients) {
+            if (totalRequired === 0 && !patients && !resourceNotes.length) {
                 // No-requirement mission type — dispatch empty once.
                 // vehicle_state is safe to use ONLY here as a one-time marker,
                 // since there's nothing to ever top up on a no-req mission.
@@ -762,6 +864,7 @@
                     ? `  PART  ${name} [type ${mtid}] -> ${selectedIds.length} vehicle(s) (${unfilled} slot(s) unfilled, will retry)`
                     : `  SENT  ${name} [type ${mtid}] -> ${selectedIds.length} vehicle(s)`);
                 selectedNames.forEach((n) => log(`         + ${n}`));
+                resourceNotes.forEach((n) => log(`         ~ ${n}`));
                 upsertMissionRow(
                     rowKey, name,
                     unfilled > 0 ? `Dispatched (${selectedIds.length}), Missing ${unfilled}` : `Dispatched (${selectedIds.length})`,
@@ -1007,6 +1110,36 @@
                             <button id="mc-taskforce-add" style="${btnStyle} flex:0 0 auto; width:56px;">Add</button>
                         </div>
                     </div>
+
+                    <div style="all:unset; display:block; margin-top:20px; padding-top:14px; border-top:1px solid #eee;">
+                        <div style="all:unset; display:block; font-weight:bold; color:#222; margin-bottom:4px;">Personnel Certifications</div>
+                        <div style="all:unset; display:block; color:#888; font-size:11px; margin-bottom:10px;">
+                            Map a certification the game reports as short (e.g. "HazMat", "Technical Rescuer") to a vehicle class from your links.json. While the mission still reports that shortfall, the bot sends one more matching vehicle per batch.
+                        </div>
+                        <div id="mc-personnel-list" style="all:unset; display:block; margin-bottom:10px;"></div>
+                        <div style="all:unset; display:flex; gap:6px;">
+                            <input type="text" id="mc-personnel-cert-input" placeholder="Certification (e.g. HazMat)"
+                                   style="all:revert; flex:1 1 auto; box-sizing:border-box; padding:5px 6px; border:1px solid #c8c8c8; border-radius:3px; font:12px Arial, Helvetica, sans-serif;">
+                            <input type="text" id="mc-personnel-class-input" placeholder="Vehicle class (e.g. hazmat vehicles)"
+                                   style="all:revert; flex:1 1 auto; box-sizing:border-box; padding:5px 6px; border:1px solid #c8c8c8; border-radius:3px; font:12px Arial, Helvetica, sans-serif;">
+                            <button id="mc-personnel-add" style="${btnStyle} flex:0 0 auto; width:56px;">Add</button>
+                        </div>
+                    </div>
+
+                    <div style="all:unset; display:block; margin-top:20px; padding-top:14px; border-top:1px solid #eee;">
+                        <div style="all:unset; display:block; font-weight:bold; color:#222; margin-bottom:4px;">Resource Needs</div>
+                        <div style="all:unset; display:block; color:#888; font-size:11px; margin-bottom:10px;">
+                            Map a resource keyword the game reports as short (e.g. "water", "foam") to a vehicle class that supplies it. Same reactive top-up as certifications above.
+                        </div>
+                        <div id="mc-resource-list" style="all:unset; display:block; margin-bottom:10px;"></div>
+                        <div style="all:unset; display:flex; gap:6px;">
+                            <input type="text" id="mc-resource-key-input" placeholder="Resource (e.g. foam)"
+                                   style="all:revert; flex:1 1 auto; box-sizing:border-box; padding:5px 6px; border:1px solid #c8c8c8; border-radius:3px; font:12px Arial, Helvetica, sans-serif;">
+                            <input type="text" id="mc-resource-class-input" placeholder="Vehicle class (e.g. water tankers)"
+                                   style="all:revert; flex:1 1 auto; box-sizing:border-box; padding:5px 6px; border:1px solid #c8c8c8; border-radius:3px; font:12px Arial, Helvetica, sans-serif;">
+                            <button id="mc-resource-add" style="${btnStyle} flex:0 0 auto; width:56px;">Add</button>
+                        </div>
+                    </div>
                 </div>
             </div>
         `;
@@ -1101,11 +1234,90 @@
             renderTaskForces();
         }
 
+        // Shared renderer for the two "keyword -> vehicle class" mapping lists
+        // (Personnel Certifications, Resource Needs) — same row/remove-button
+        // pattern as Task Forces, just simpler entries.
+        function renderMappingList(listEl, getFn, setFn) {
+            const mappings = getFn();
+            listEl.innerHTML = '';
+            if (!mappings.length) {
+                const empty = document.createElement('div');
+                empty.style.cssText = 'all:unset; display:block; color:#999; font-size:11px; font-style:italic;';
+                empty.textContent = 'None defined yet.';
+                listEl.appendChild(empty);
+                return;
+            }
+            mappings.forEach((m, idx) => {
+                const row = document.createElement('div');
+                row.style.cssText = `
+                    all:unset; display:flex; align-items:center; justify-content:space-between; gap:8px;
+                    padding:5px 8px; margin-bottom:4px; background:#f7f7f7; border:1px solid #e5e5e5;
+                    border-radius:3px; font-size:11px; color:#333;
+                `;
+                const label = document.createElement('span');
+                label.textContent = `${m.key} → ${m.vehicleClass}`;
+                label.style.cssText = 'all:unset; flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#333;';
+                const removeBtn = document.createElement('span');
+                removeBtn.textContent = '×';
+                removeBtn.title = 'Remove';
+                removeBtn.style.cssText = 'all:unset; cursor:pointer; color:#c62828; font-weight:bold; padding:0 4px; flex-shrink:0;';
+                removeBtn.addEventListener('click', () => {
+                    const current = getFn();
+                    current.splice(idx, 1);
+                    setFn(current);
+                    renderMappingList(listEl, getFn, setFn);
+                });
+                row.appendChild(label);
+                row.appendChild(removeBtn);
+                listEl.appendChild(row);
+            });
+        }
+
+        const personnelList = panel.querySelector('#mc-personnel-list');
+        const personnelCertInput = panel.querySelector('#mc-personnel-cert-input');
+        const personnelClassInput = panel.querySelector('#mc-personnel-class-input');
+
+        function addPersonnelMapping() {
+            const key = personnelCertInput.value.trim();
+            const vehicleClass = personnelClassInput.value.trim();
+            if (!key || !vehicleClass) {
+                log('Personnel mapping needs both a certification and a vehicle class.');
+                return;
+            }
+            const mappings = getPersonnelMappings();
+            mappings.push({ key, vehicleClass });
+            setPersonnelMappings(mappings);
+            personnelCertInput.value = '';
+            personnelClassInput.value = '';
+            renderMappingList(personnelList, getPersonnelMappings, setPersonnelMappings);
+        }
+
+        const resourceList = panel.querySelector('#mc-resource-list');
+        const resourceKeyInput = panel.querySelector('#mc-resource-key-input');
+        const resourceClassInput = panel.querySelector('#mc-resource-class-input');
+
+        function addResourceMapping() {
+            const key = resourceKeyInput.value.trim();
+            const vehicleClass = resourceClassInput.value.trim();
+            if (!key || !vehicleClass) {
+                log('Resource mapping needs both a resource keyword and a vehicle class.');
+                return;
+            }
+            const mappings = getResourceMappings();
+            mappings.push({ key, vehicleClass });
+            setResourceMappings(mappings);
+            resourceKeyInput.value = '';
+            resourceClassInput.value = '';
+            renderMappingList(resourceList, getResourceMappings, setResourceMappings);
+        }
+
         function openSettings() {
             const s = getSettings();
             allianceCheckbox.checked = s.dispatchAllianceCalls;
             scheduledCheckbox.checked = s.dispatchScheduledCalls;
             renderTaskForces();
+            renderMappingList(personnelList, getPersonnelMappings, setPersonnelMappings);
+            renderMappingList(resourceList, getResourceMappings, setResourceMappings);
             overlay.style.display = 'flex';
         }
         function closeSettings() {
@@ -1120,6 +1332,20 @@
         });
         taskforceInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') addTaskForce();
+        });
+        panel.querySelector('#mc-personnel-add').addEventListener('click', addPersonnelMapping);
+        personnelCertInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') addPersonnelMapping();
+        });
+        personnelClassInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') addPersonnelMapping();
+        });
+        panel.querySelector('#mc-resource-add').addEventListener('click', addResourceMapping);
+        resourceKeyInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') addResourceMapping();
+        });
+        resourceClassInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') addResourceMapping();
         });
 
         // Saved immediately on change — takes effect on the next batch,
