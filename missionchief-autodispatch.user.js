@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.8.0
+// @version      0.11.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -22,7 +22,6 @@
         sleepPerBatchMs: 45000,   // time between batches
         dispatchDelayMs: 1000,    // time between individual dispatch calls
         missionsPerRun: 30,
-        showOwn: true,
     };
 
     // ── Utilities ─────────────────────────────────────────────────────────
@@ -184,6 +183,65 @@
         return raw ? JSON.parse(raw) : [];
     }
 
+    // Per-user preferences, toggled from the Settings panel. Defaults match
+    // the bot's original behavior (own calls only, all mission types) so
+    // installing/updating doesn't silently change anyone's existing setup.
+    const DEFAULT_SETTINGS = {
+        dispatchAllianceCalls: false,
+        dispatchScheduledCalls: true,
+    };
+    function getSettings() {
+        const raw = GM_getValue('mc_settings', null);
+        return raw ? { ...DEFAULT_SETTINGS, ...JSON.parse(raw) } : { ...DEFAULT_SETTINGS };
+    }
+    function setSettings(obj) {
+        GM_setValue('mc_settings', JSON.stringify(obj));
+    }
+
+    // Task forces: named groups of vehicle captions that should always be
+    // dispatched together. Matched by exact caption text (case-insensitive),
+    // since that's what's visible in-game — no need to dig up vehicle IDs.
+    // Stored as an array of { name, members: [...] } objects.
+    function getTaskForces() {
+        const raw = GM_getValue('mc_taskForces', null);
+        if (!raw) return [];
+        const parsed = JSON.parse(raw);
+        // Migrate from the old plain-array format (no names) if present.
+        return parsed.map((g, i) =>
+            Array.isArray(g) ? { name: `Task Force ${i + 1}`, members: g } : g
+        );
+    }
+    function setTaskForces(groups) {
+        GM_setValue('mc_taskForces', JSON.stringify(groups));
+    }
+
+    // Given a vehicle's caption, returns the set of OTHER captions (lowercased)
+    // that share a task force with it. A vehicle can belong to more than one
+    // group; partners from every matching group are included.
+    function findTaskForcePartnerNames(caption, taskForces) {
+        const lower = (caption || '').toLowerCase();
+        const partners = new Set();
+        for (const group of taskForces) {
+            const members = group.members || [];
+            if (members.some((n) => n.toLowerCase() === lower)) {
+                members.forEach((n) => {
+                    if (n.toLowerCase() !== lower) partners.add(n.toLowerCase());
+                });
+            }
+        }
+        return partners;
+    }
+
+    // Scheduled/special missions (fire alarms, exercises, speed traps, drills,
+    // inspections, etc.) don't have a clean dedicated API flag we've found, so
+    // this matches on caption keywords instead. Expand this list if you spot
+    // another recurring event type slipping through.
+    const SCHEDULED_KEYWORDS = ['fire alarm', 'exercise', 'speed trap', 'training', 'drill', 'inspection'];
+    function isScheduledMission(mission) {
+        const caption = (mission.caption || '').toLowerCase();
+        return SCHEDULED_KEYWORDS.some((kw) => caption.includes(kw));
+    }
+
     // ── API calls (confirmed endpoints from the Python bot) ─────────────────
     async function fetchMissions() {
         const res = await fetch('/map/missions_json', {
@@ -194,13 +252,13 @@
         const text = await res.text();
         if (!text.trim()) return [];
         const data = JSON.parse(text);
-        let missions = Array.isArray(data)
+        // Returns everything unfiltered — alliance/scheduled/ignore-list
+        // filtering happens in runBatch() against live settings, so toggling
+        // a setting takes effect on the very next batch without needing to
+        // change this function.
+        return Array.isArray(data)
             ? data
             : (data.missions || data.result || Object.values(data)[0] || []);
-        if (CONFIG.showOwn) {
-            missions = missions.filter((m) => !m.alliance_id && !m.is_alliance);
-        }
-        return missions;
     }
 
     async function fetchVehicles() {
@@ -521,7 +579,19 @@
         log(`  ${missions.length} active missions | ${available.length} vehicles available`);
 
         const vehicleById = new Map(vehicles.map((v) => [v.id, v]));
+        const availableByCaption = new Map();
+        for (const v of available) {
+            if (v.caption) availableByCaption.set(v.caption.toLowerCase(), v);
+        }
+        const taskForces = getTaskForces();
 
+        const settings = getSettings();
+        if (!settings.dispatchAllianceCalls) {
+            missions = missions.filter((m) => !m.alliance_id && !m.is_alliance);
+        }
+        if (!settings.dispatchScheduledCalls) {
+            missions = missions.filter((m) => !isScheduledMission(m));
+        }
         const ignoreList = getIgnoreList().map((n) => n.toLowerCase());
         missions = missions.filter((m) => !ignoreList.includes((m.caption || '').toLowerCase()));
 
@@ -642,6 +712,40 @@
                     selectedNames.push(
                         `${v.caption || v.id} (fms=${v.fms_real ?? v.fms_show}, target=${v.target_type || 'none'}/${v.target_id ?? '-'}, queued=${v.queued_mission_id ?? '-'})`
                     );
+                }
+            }
+
+            // Task forces: if any selected vehicle has a dispatch partner that's
+            // currently available and not already picked, pull it in too — even
+            // if the mission's own requirements never called for that vehicle
+            // type. BFS-style so chains (A pairs with B, B pairs with C) resolve
+            // fully in one pass.
+            if (taskForces.length && selectedIds.length) {
+                const addedPartners = [];
+                let frontier = [...selectedIds];
+                while (frontier.length) {
+                    const nextFrontier = [];
+                    for (const id of frontier) {
+                        const v = vehicleById.get(id);
+                        if (!v || !v.caption) continue;
+                        const partnerNames = findTaskForcePartnerNames(v.caption, taskForces);
+                        for (const partnerNameLower of partnerNames) {
+                            const partnerVehicle = availableByCaption.get(partnerNameLower);
+                            if (partnerVehicle && !usedIds.has(partnerVehicle.id)) {
+                                selectedIds.push(partnerVehicle.id);
+                                usedIds.add(partnerVehicle.id);
+                                addedPartners.push(partnerVehicle);
+                                nextFrontier.push(partnerVehicle.id);
+                            }
+                        }
+                    }
+                    frontier = nextFrontier;
+                }
+                if (addedPartners.length) {
+                    addedPartners.forEach((v) => selectedNames.push(
+                        `${v.caption || v.id} (task force partner, fms=${v.fms_real ?? v.fms_show})`
+                    ));
+                    log(`  TASKFORCE +${addedPartners.length} partner vehicle(s) added for ${name}`);
                 }
             }
 
@@ -858,6 +962,7 @@
                 <button id="mc-start" style="${btnStyle}">Start</button>
                 <button id="mc-stop" style="${btnStyle}">Stop</button>
                 <button id="mc-import" style="${btnStyle}">Import Cache</button>
+                <button id="mc-settings-btn" style="${btnStyle}">Settings</button>
             </div>
             <div id="mc-rows" style="all:unset; display:block; box-sizing:border-box; width:100%;
                  flex: 1 1 auto; min-height: 60px; background:#fff; overflow-y:auto;"></div>
@@ -869,6 +974,41 @@
                  linear-gradient(135deg, transparent 0%, transparent 40%, #999 40%, #999 46%, transparent 46%,
                  transparent 60%, #999 60%, #999 66%, transparent 66%, transparent 80%, #999 80%, #999 86%, transparent 86%);"></div>
             <input type="file" id="mc-file-input" multiple accept=".json" style="display:none;">
+
+            <div id="mc-settings-overlay" style="all:unset; position:absolute; inset:0; display:none;
+                 flex-direction:column; background:#fff; z-index:10; font-family:Arial, Helvetica, sans-serif;">
+                <div style="all:unset; display:flex; justify-content:space-between; align-items:center;
+                     padding:6px 10px; background:linear-gradient(#e0483a,#c0392b); color:#fff;
+                     font:bold 13px/1.3 Arial, Helvetica, sans-serif; flex-shrink:0;">
+                    <span style="color:#fff;">Settings</span>
+                    <span id="mc-settings-close" style="cursor:pointer; color:#fff; font-weight:bold; padding:0 6px; font-size:16px; line-height:1;">&times;</span>
+                </div>
+                <div style="all:unset; display:block; padding:14px; overflow-y:auto; flex:1 1 auto; box-sizing:border-box; width:100%;">
+                    <label style="all:unset; display:flex; align-items:flex-start; gap:8px; margin-bottom:16px; cursor:pointer; color:#333; font:12px/1.4 Arial, Helvetica, sans-serif;">
+                        <input type="checkbox" id="mc-setting-alliance" style="all:revert; margin-top:2px; flex-shrink:0;">
+                        <span>Dispatch to Alliance Calls<br><span style="color:#888; font-size:11px;">Include missions belonging to your alliance, not just your own department.</span></span>
+                    </label>
+                    <label style="all:unset; display:flex; align-items:flex-start; gap:8px; cursor:pointer; color:#333; font:12px/1.4 Arial, Helvetica, sans-serif;">
+                        <input type="checkbox" id="mc-setting-scheduled" style="all:revert; margin-top:2px; flex-shrink:0;">
+                        <span>Dispatch to Scheduled/Special Calls<br><span style="color:#888; font-size:11px;">Fire alarms, exercises, speed traps, drills, inspections, and similar events.</span></span>
+                    </label>
+
+                    <div style="all:unset; display:block; margin-top:20px; padding-top:14px; border-top:1px solid #eee;">
+                        <div style="all:unset; display:block; font-weight:bold; color:#222; margin-bottom:4px;">Task Forces</div>
+                        <div style="all:unset; display:block; color:#888; font-size:11px; margin-bottom:10px;">
+                            Vehicles that should always be dispatched together. When any member is sent to a call, the others go too if available.
+                        </div>
+                        <div id="mc-taskforce-list" style="all:unset; display:block; margin-bottom:10px;"></div>
+                        <input type="text" id="mc-taskforce-name-input" placeholder="Task force name (e.g. Truck Company 4)"
+                               style="all:revert; box-sizing:border-box; width:100%; padding:5px 6px; border:1px solid #c8c8c8; border-radius:3px; font:12px Arial, Helvetica, sans-serif; margin-bottom:6px;">
+                        <div style="all:unset; display:flex; gap:6px;">
+                            <input type="text" id="mc-taskforce-input" placeholder="PSF - Engine 4, PSF - Ladder 1"
+                                   style="all:revert; flex:1 1 auto; box-sizing:border-box; padding:5px 6px; border:1px solid #c8c8c8; border-radius:3px; font:12px Arial, Helvetica, sans-serif;">
+                            <button id="mc-taskforce-add" style="${btnStyle} flex:0 0 auto; width:56px;">Add</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
         `;
         document.body.appendChild(panel);
 
@@ -883,9 +1023,119 @@
         panel.querySelector('#mc-import').addEventListener('click', () => fileInput.click());
         fileInput.addEventListener('change', handleImport);
 
+        setupSettingsPanel(panel);
+
         setupDragging(panel, panel.querySelector('#mc-header'));
         setupResizing(panel, panel.querySelector('#mc-resize'));
         setupPopupWatcher(panel);
+    }
+
+    function setupSettingsPanel(panel) {
+        const overlay = panel.querySelector('#mc-settings-overlay');
+        const allianceCheckbox = panel.querySelector('#mc-setting-alliance');
+        const scheduledCheckbox = panel.querySelector('#mc-setting-scheduled');
+        const taskforceList = panel.querySelector('#mc-taskforce-list');
+        const taskforceNameInput = panel.querySelector('#mc-taskforce-name-input');
+        const taskforceInput = panel.querySelector('#mc-taskforce-input');
+
+        function renderTaskForces() {
+            const groups = getTaskForces();
+            taskforceList.innerHTML = '';
+            if (!groups.length) {
+                const empty = document.createElement('div');
+                empty.style.cssText = 'all:unset; display:block; color:#999; font-size:11px; font-style:italic;';
+                empty.textContent = 'No task forces yet.';
+                taskforceList.appendChild(empty);
+                return;
+            }
+            groups.forEach((group, idx) => {
+                const row = document.createElement('div');
+                row.style.cssText = `
+                    all:unset; display:flex; align-items:center; justify-content:space-between; gap:8px;
+                    padding:5px 8px; margin-bottom:4px; background:#f7f7f7; border:1px solid #e5e5e5;
+                    border-radius:3px; font-size:11px; color:#333;
+                `;
+                const label = document.createElement('span');
+                label.innerHTML = '';
+                label.style.cssText = 'all:unset; flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
+                const nameSpan = document.createElement('span');
+                nameSpan.textContent = group.name;
+                nameSpan.style.cssText = 'all:unset; font-weight:bold; color:#222;';
+                const membersSpan = document.createElement('span');
+                membersSpan.textContent = `: ${group.members.join(' + ')}`;
+                membersSpan.style.cssText = 'all:unset; color:#666;';
+                label.appendChild(nameSpan);
+                label.appendChild(membersSpan);
+                const removeBtn = document.createElement('span');
+                removeBtn.textContent = '×';
+                removeBtn.title = 'Remove';
+                removeBtn.style.cssText = 'all:unset; cursor:pointer; color:#c62828; font-weight:bold; padding:0 4px; flex-shrink:0;';
+                removeBtn.addEventListener('click', () => {
+                    const current = getTaskForces();
+                    current.splice(idx, 1);
+                    setTaskForces(current);
+                    renderTaskForces();
+                });
+                row.appendChild(label);
+                row.appendChild(removeBtn);
+                taskforceList.appendChild(row);
+            });
+        }
+
+        function addTaskForce() {
+            const members = taskforceInput.value
+                .split(',')
+                .map((n) => n.trim())
+                .filter(Boolean);
+            if (members.length < 2) {
+                log('Task force needs at least 2 vehicle names, comma-separated.');
+                return;
+            }
+            const groups = getTaskForces();
+            const typedName = taskforceNameInput.value.trim();
+            const name = typedName || `Task Force ${groups.length + 1}`;
+            groups.push({ name, members });
+            setTaskForces(groups);
+            taskforceNameInput.value = '';
+            taskforceInput.value = '';
+            renderTaskForces();
+        }
+
+        function openSettings() {
+            const s = getSettings();
+            allianceCheckbox.checked = s.dispatchAllianceCalls;
+            scheduledCheckbox.checked = s.dispatchScheduledCalls;
+            renderTaskForces();
+            overlay.style.display = 'flex';
+        }
+        function closeSettings() {
+            overlay.style.display = 'none';
+        }
+
+        panel.querySelector('#mc-settings-btn').addEventListener('click', openSettings);
+        panel.querySelector('#mc-settings-close').addEventListener('click', closeSettings);
+        panel.querySelector('#mc-taskforce-add').addEventListener('click', addTaskForce);
+        taskforceNameInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') addTaskForce();
+        });
+        taskforceInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') addTaskForce();
+        });
+
+        // Saved immediately on change — takes effect on the next batch,
+        // no separate save step needed.
+        allianceCheckbox.addEventListener('change', () => {
+            const s = getSettings();
+            s.dispatchAllianceCalls = allianceCheckbox.checked;
+            setSettings(s);
+            log(`Setting changed: Dispatch to Alliance Calls = ${s.dispatchAllianceCalls}`);
+        });
+        scheduledCheckbox.addEventListener('change', () => {
+            const s = getSettings();
+            s.dispatchScheduledCalls = scheduledCheckbox.checked;
+            setSettings(s);
+            log(`Setting changed: Dispatch to Scheduled/Special Calls = ${s.dispatchScheduledCalls}`);
+        });
     }
 
     // MissionChief's popups (station/vehicle detail pages, etc.) render inside
