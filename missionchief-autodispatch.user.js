@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.13.0
+// @version      0.14.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -261,6 +261,23 @@
         return hit ? hit.vehicleClass : null;
     }
 
+    // Tries to match a keyword straight against existing links.json class
+    // names (e.g. "water" -> "water tankers") before falling back to a
+    // user-defined mapping — covers the common case with zero setup, only
+    // requiring the Settings mapping for names that don't naturally align
+    // (e.g. "Technical Rescuer" needing to point at "heavy rescue vehicles").
+    function autoMatchVehicleClass(keyword, links) {
+        const lower = (keyword || '').toLowerCase();
+        const classNames = Object.keys(links);
+        const exact = classNames.find((c) => c.toLowerCase() === lower);
+        if (exact) return exact;
+        const partial = classNames.find((c) => {
+            const cLower = c.toLowerCase();
+            return cLower.includes(lower) || lower.includes(cLower);
+        });
+        return partial || null;
+    }
+
     // Parses mission.missing_text — a live, game-computed field reporting
     // exactly what's still short, e.g.
     // {"vehicles":"5 firetrucks","personnel":"4x HazMat","other":"200 gal. foam"}
@@ -514,23 +531,27 @@
         return res.ok;
     }
 
-    // Reads the "Staff" table (Name / Training columns) off a vehicle's
-    // detail page — the only place we've found actual per-person
-    // certification data, since there's no personnel/employee API endpoint.
+    // Reads a vehicle's detail page for two things not available anywhere in
+    // the API: the Staff table (Name / Training columns, for certification
+    // checks) and any "{Resource} amount" info rows (e.g. "Water amount:
+    // 750 gal.", "Foam amount: 25 gal.") for actual carried capacity. Both
+    // come off the same page, so one fetch covers both use cases.
     // Uses DOMParser (real browser context) rather than regex, since table
-    // structure is more reliably queried by header text than by markup shape.
-    const staffCache = new Map(); // vehicleId -> { staff, fetchedAt } — avoid re-fetching every check within a batch
-    const STAFF_CACHE_MS = 30000;
+    // structure is more reliably queried by header/label text than markup shape.
+    const vehicleDetailsCache = new Map(); // vehicleId -> { staff, resources, fetchedAt }
+    const DETAILS_CACHE_MS = 30000;
 
-    async function fetchVehicleStaff(vehicleId) {
-        const cached = staffCache.get(vehicleId);
-        if (cached && Date.now() - cached.fetchedAt < STAFF_CACHE_MS) return cached.staff;
+    async function fetchVehicleDetails(vehicleId) {
+        const cached = vehicleDetailsCache.get(vehicleId);
+        if (cached && Date.now() - cached.fetchedAt < DETAILS_CACHE_MS) return cached;
 
+        const empty = { staff: [], resources: {}, fetchedAt: Date.now() };
         const res = await fetch(`/vehicles/${vehicleId}`, { credentials: 'same-origin' });
-        if (!res.ok) return [];
+        if (!res.ok) return empty;
         const html = await res.text();
         const doc = new DOMParser().parseFromString(html, 'text/html');
 
+        // Staff table
         let staff = [];
         const tables = Array.from(doc.querySelectorAll('table'));
         for (const table of tables) {
@@ -552,8 +573,24 @@
             break;
         }
 
-        staffCache.set(vehicleId, { staff, fetchedAt: Date.now() });
-        return staff;
+        // Resource capacity rows — plain label/value pairs like
+        // "Water amount" | "750 gal." sitting in the vehicle's info table.
+        const resources = {};
+        const allRows = Array.from(doc.querySelectorAll('tr'));
+        for (const tr of allRows) {
+            const cells = Array.from(tr.querySelectorAll('td, th'));
+            if (cells.length < 2) continue;
+            const label = cells[0].textContent.trim().toLowerCase();
+            const m = label.match(/^(.+?)\s*amount$/);
+            if (!m) continue;
+            const resourceName = m[1].trim();
+            const numMatch = cells[1].textContent.trim().match(/([\d.]+)/);
+            if (numMatch) resources[resourceName] = parseFloat(numMatch[1]);
+        }
+
+        const result = { staff, resources, fetchedAt: Date.now() };
+        vehicleDetailsCache.set(vehicleId, result);
+        return result;
     }
 
     function staffHasCertification(staff, certKeyword) {
@@ -562,6 +599,15 @@
             const t = s.training.toLowerCase();
             return t.includes(lower) || lower.includes(t);
         });
+    }
+
+    function vehicleHasResource(resources, resourceKeyword) {
+        const lower = (resourceKeyword || '').toLowerCase();
+        for (const [name, amount] of Object.entries(resources)) {
+            const n = name.toLowerCase();
+            if ((n.includes(lower) || lower.includes(n)) && amount > 0) return true;
+        }
+        return false;
     }
 
     async function runPrisonerTransportPass(vehicles) {
@@ -793,26 +839,22 @@
                 }
             }
 
-            // Resources (water, foam, etc.): the game computes what's still
-            // short in missing_text.other, but there's no capacity-per-vehicle
-            // data anywhere, so this stays reactive — send ONE more matching
-            // vehicle per batch, let the game's own next missing_text confirm.
+            // Personnel certifications & resources (water, foam, etc.): both
+            // verified against real per-vehicle data scraped from the vehicle
+            // detail page (crew Training table, and "{X} amount" capacity
+            // rows) rather than guessed. Settings mappings are OPTIONAL —
+            // they narrow which vehicles get checked first for speed, but
+            // the bot works with zero configuration by checking the nearest
+            // available vehicles broadly when no mapping/class-name match exists.
             const missing = parseMissingText(mission);
             const resourceNotes = [];
-            const hasPersonnelNeed = !!(missing && missing.personnel);
-            if (missing && resourceMappings.length) {
-                for (const need of parseOtherNeeds(missing.other)) {
-                    const cls = findMappedVehicleClass(need.resource, resourceMappings);
-                    const typeIds = cls ? state.links[cls] : null;
-                    if (typeIds && typeIds.length) {
-                        slots.push(typeIds);
-                        resourceNotes.push(`other: ${need.raw} still needed -> +1 ${cls}`);
-                    }
-                }
-            }
+            const personnelNeeds = missing ? parsePersonnelNeeds(missing.personnel) : [];
+            const otherNeeds = missing ? parseOtherNeeds(missing.other) : [];
+            const hasPersonnelNeed = personnelNeeds.length > 0;
+            const hasResourceNeed = otherNeeds.length > 0;
 
             const totalRequired = (entry.requirements || []).reduce((s, r) => s + parseInt(r.qty, 10), 0);
-            if (totalRequired === 0 && !patients && !resourceNotes.length && !hasPersonnelNeed) {
+            if (totalRequired === 0 && !patients && !hasPersonnelNeed && !hasResourceNeed) {
                 // No-requirement mission type — dispatch empty once.
                 // vehicle_state is safe to use ONLY here as a one-time marker,
                 // since there's nothing to ever top up on a no-req mission.
@@ -830,7 +872,7 @@
                 continue;
             }
 
-            if (!slots.length && !hasPersonnelNeed) {
+            if (!slots.length && !hasPersonnelNeed && !hasResourceNeed) {
                 log(`  SKIP  ${name} [type ${mtid}] (fully staffed already)`);
                 upsertMissionRow(rowKey, name, 'Fully Staffed', 'fullyStaffed');
                 continue;
@@ -856,48 +898,75 @@
                 }
             }
 
-            // Personnel certifications: unlike resources, we CAN verify this —
-            // the vehicle detail page's Staff table lists each crew member's
-            // Training. Check the nearest few available candidates of the
-            // mapped vehicle class and only commit one that actually has the
-            // certification, instead of blindly sending the nearest vehicle
-            // of that class and hoping.
-            const CERT_CANDIDATES_TO_CHECK = 3;
-            if (missing && personnelMappings.length) {
-                for (const need of parsePersonnelNeeds(missing.personnel)) {
-                    const cls = findMappedVehicleClass(need.cert, personnelMappings);
-                    const typeIds = cls ? state.links[cls] : null;
-                    if (!typeIds || !typeIds.length) continue;
+            // Builds a distance-sorted candidate pool: narrowed to a mapped/
+            // auto-matched vehicle class if one exists (fewer, more relevant
+            // checks), otherwise every available vehicle (broader, but still
+            // works with zero configuration).
+            const CANDIDATES_TO_CHECK = 3;
+            function nearestCandidates(typeIds) {
+                const pool = typeIds
+                    ? available.filter((v) => !usedIds.has(v.id) && typeIds.includes(v.vehicle_type))
+                    : available.filter((v) => !usedIds.has(v.id));
+                return pool
+                    .map((v) => {
+                        const [lat, lon] = state.buildingCoords[v.building_id] || [0, 0];
+                        return { v, dist: haversineKm(lat, lon, mlat, mlon) };
+                    })
+                    .sort((a, b) => a.dist - b.dist)
+                    .slice(0, CANDIDATES_TO_CHECK)
+                    .map((x) => x.v);
+            }
 
-                    const candidates = available
-                        .filter((v) => !usedIds.has(v.id) && typeIds.includes(v.vehicle_type))
-                        .map((v) => {
-                            const [lat, lon] = state.buildingCoords[v.building_id] || [0, 0];
-                            return { v, dist: haversineKm(lat, lon, mlat, mlon) };
-                        })
-                        .sort((a, b) => a.dist - b.dist)
-                        .slice(0, CERT_CANDIDATES_TO_CHECK)
-                        .map((x) => x.v);
+            for (const need of personnelNeeds) {
+                const cls = findMappedVehicleClass(need.cert, personnelMappings);
+                const typeIds = cls ? state.links[cls] : null;
+                const candidates = nearestCandidates(typeIds);
 
-                    let matched = null;
-                    for (const cand of candidates) {
-                        const staff = await fetchVehicleStaff(cand.id);
-                        if (staffHasCertification(staff, need.cert)) {
-                            matched = cand;
-                            break;
-                        }
+                let matched = null;
+                for (const cand of candidates) {
+                    const details = await fetchVehicleDetails(cand.id);
+                    if (staffHasCertification(details.staff, need.cert)) {
+                        matched = cand;
+                        break;
                     }
+                }
 
-                    if (matched) {
-                        selectedIds.push(matched.id);
-                        usedIds.add(matched.id);
-                        selectedNames.push(`${matched.caption || matched.id} (verified: crew certified in ${need.cert})`);
-                        resourceNotes.push(`personnel: ${need.qty}x ${need.cert} still needed -> sent ${matched.caption || matched.id} (certification confirmed)`);
-                    } else if (candidates.length) {
-                        resourceNotes.push(`personnel: ${need.qty}x ${need.cert} still needed -> checked ${candidates.length} nearby ${cls}, none certified`);
-                    } else {
-                        resourceNotes.push(`personnel: ${need.qty}x ${need.cert} still needed -> no available ${cls} nearby`);
+                if (matched) {
+                    selectedIds.push(matched.id);
+                    usedIds.add(matched.id);
+                    selectedNames.push(`${matched.caption || matched.id} (verified: crew certified in ${need.cert})`);
+                    resourceNotes.push(`personnel: ${need.qty}x ${need.cert} still needed -> sent ${matched.caption || matched.id} (certification confirmed)`);
+                } else if (candidates.length) {
+                    resourceNotes.push(`personnel: ${need.qty}x ${need.cert} still needed -> checked ${candidates.length} nearby vehicle(s), none certified`);
+                } else {
+                    resourceNotes.push(`personnel: ${need.qty}x ${need.cert} still needed -> no available vehicles nearby to check`);
+                }
+            }
+
+            for (const need of otherNeeds) {
+                const cls = autoMatchVehicleClass(need.resource, state.links)
+                    || findMappedVehicleClass(need.resource, resourceMappings);
+                const typeIds = cls ? state.links[cls] : null;
+                const candidates = nearestCandidates(typeIds);
+
+                let matched = null;
+                for (const cand of candidates) {
+                    const details = await fetchVehicleDetails(cand.id);
+                    if (vehicleHasResource(details.resources, need.resource)) {
+                        matched = cand;
+                        break;
                     }
+                }
+
+                if (matched) {
+                    selectedIds.push(matched.id);
+                    usedIds.add(matched.id);
+                    selectedNames.push(`${matched.caption || matched.id} (verified: carries ${need.resource})`);
+                    resourceNotes.push(`other: ${need.raw} still needed -> sent ${matched.caption || matched.id} (capacity confirmed)`);
+                } else if (candidates.length) {
+                    resourceNotes.push(`other: ${need.raw} still needed -> checked ${candidates.length} nearby vehicle(s), none carrying ${need.resource}`);
+                } else {
+                    resourceNotes.push(`other: ${need.raw} still needed -> no available vehicles nearby to check`);
                 }
             }
 
@@ -1196,9 +1265,9 @@
                     </div>
 
                     <div style="all:unset; display:block; margin-top:20px; padding-top:14px; border-top:1px solid #eee;">
-                        <div style="all:unset; display:block; font-weight:bold; color:#222; margin-bottom:4px;">Personnel Certifications</div>
+                        <div style="all:unset; display:block; font-weight:bold; color:#222; margin-bottom:4px;">Personnel Certifications <span style="font-weight:normal; color:#999;">(optional)</span></div>
                         <div style="all:unset; display:block; color:#888; font-size:11px; margin-bottom:10px;">
-                            Map a certification the game reports as short (e.g. "HazMat", "Technical Rescuer") to a vehicle class from your links.json. The bot checks the nearest available vehicles' actual crew training and only sends one that's verified certified.
+                            The bot checks nearby vehicles' actual crew training automatically — no setup required. Only add a mapping here if you want to narrow the search to a specific vehicle class (e.g. "HazMat" → "hazmat vehicles") for speed.
                         </div>
                         <div id="mc-personnel-list" style="all:unset; display:block; margin-bottom:10px;"></div>
                         <div style="all:unset; display:flex; gap:6px;">
@@ -1211,9 +1280,9 @@
                     </div>
 
                     <div style="all:unset; display:block; margin-top:20px; padding-top:14px; border-top:1px solid #eee;">
-                        <div style="all:unset; display:block; font-weight:bold; color:#222; margin-bottom:4px;">Resource Needs</div>
+                        <div style="all:unset; display:block; font-weight:bold; color:#222; margin-bottom:4px;">Resource Needs <span style="font-weight:normal; color:#999;">(optional)</span></div>
                         <div style="all:unset; display:block; color:#888; font-size:11px; margin-bottom:10px;">
-                            Map a resource keyword the game reports as short (e.g. "water", "foam") to a vehicle class that supplies it. Same reactive top-up as certifications above.
+                            The bot auto-matches against your links.json class names and verifies actual carried capacity (e.g. "Water amount") on the vehicle. Only add a mapping here if the resource keyword doesn't naturally match any class name.
                         </div>
                         <div id="mc-resource-list" style="all:unset; display:block; margin-bottom:10px;"></div>
                         <div style="all:unset; display:flex; gap:6px;">
