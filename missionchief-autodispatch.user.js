@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.14.0
+// @version      0.14.2
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -917,7 +917,34 @@
                     .map((x) => x.v);
             }
 
+            const unresolvedNeeds = []; // short descriptions of shortfalls we couldn't fill, for accurate row status
+
+            // Vehicles already committed to this mission — either already on
+            // scene/en route from a prior batch, or just selected THIS batch
+            // to satisfy a plain vehicle-count requirement (e.g. "5 firetrucks").
+            // Check these FIRST: an engine dispatched to meet a firetruck
+            // requirement may already be carrying the foam/certification a
+            // separate personnel/resource line is asking for, and searching
+            // for an additional vehicle without checking that first wastes a
+            // dispatch on something already covered.
+            async function findAlreadyCovering(checkFn) {
+                const idsToCheck = [...new Set([...assigned.ids, ...selectedIds])];
+                for (const id of idsToCheck) {
+                    const v = vehicleById.get(id);
+                    if (!v) continue;
+                    const details = await fetchVehicleDetails(id);
+                    if (checkFn(details)) return v;
+                }
+                return null;
+            }
+
             for (const need of personnelNeeds) {
+                const already = await findAlreadyCovering((d) => staffHasCertification(d.staff, need.cert));
+                if (already) {
+                    resourceNotes.push(`personnel: ${need.qty}x ${need.cert} still needed -> already covered by ${already.caption || already.id}`);
+                    continue;
+                }
+
                 const cls = findMappedVehicleClass(need.cert, personnelMappings);
                 const typeIds = cls ? state.links[cls] : null;
                 const candidates = nearestCandidates(typeIds);
@@ -938,12 +965,20 @@
                     resourceNotes.push(`personnel: ${need.qty}x ${need.cert} still needed -> sent ${matched.caption || matched.id} (certification confirmed)`);
                 } else if (candidates.length) {
                     resourceNotes.push(`personnel: ${need.qty}x ${need.cert} still needed -> checked ${candidates.length} nearby vehicle(s), none certified`);
+                    unresolvedNeeds.push(`${need.qty}x ${need.cert}`);
                 } else {
                     resourceNotes.push(`personnel: ${need.qty}x ${need.cert} still needed -> no available vehicles nearby to check`);
+                    unresolvedNeeds.push(`${need.qty}x ${need.cert}`);
                 }
             }
 
             for (const need of otherNeeds) {
+                const already = await findAlreadyCovering((d) => vehicleHasResource(d.resources, need.resource));
+                if (already) {
+                    resourceNotes.push(`other: ${need.raw} still needed -> already covered by ${already.caption || already.id}`);
+                    continue;
+                }
+
                 const cls = autoMatchVehicleClass(need.resource, state.links)
                     || findMappedVehicleClass(need.resource, resourceMappings);
                 const typeIds = cls ? state.links[cls] : null;
@@ -965,8 +1000,10 @@
                     resourceNotes.push(`other: ${need.raw} still needed -> sent ${matched.caption || matched.id} (capacity confirmed)`);
                 } else if (candidates.length) {
                     resourceNotes.push(`other: ${need.raw} still needed -> checked ${candidates.length} nearby vehicle(s), none carrying ${need.resource}`);
+                    unresolvedNeeds.push(need.raw);
                 } else {
                     resourceNotes.push(`other: ${need.raw} still needed -> no available vehicles nearby to check`);
+                    unresolvedNeeds.push(need.raw);
                 }
             }
 
@@ -1004,9 +1041,22 @@
                 }
             }
 
+            // Combines vehicle-slot shortfall with any unresolved
+            // personnel/resource needs into one accurate "Missing" label —
+            // previously this only ever reflected vehicle slots, so a mission
+            // could show "Missing 0" while still genuinely short on something
+            // like foam, which was misleading.
+            function missingLabel() {
+                const bits = [];
+                if (unfilled > 0) bits.push(`${unfilled} vehicle(s)`);
+                if (unresolvedNeeds.length) bits.push(unresolvedNeeds.join(', '));
+                return bits.length ? `Missing ${bits.join(' + ')}` : null;
+            }
+
             if (!selectedIds.length) {
                 log(`  SKIP  ${name} [type ${mtid}] (no available vehicles)`);
-                upsertMissionRow(rowKey, name, `Missing ${unfilled}`, 'noUnits');
+                resourceNotes.forEach((n) => log(`         ~ ${n}`));
+                upsertMissionRow(rowKey, name, missingLabel() || `Missing ${unfilled}`, 'noUnits');
                 continue;
             }
 
@@ -1018,10 +1068,11 @@
                     : `  SENT  ${name} [type ${mtid}] -> ${selectedIds.length} vehicle(s)`);
                 selectedNames.forEach((n) => log(`         + ${n}`));
                 resourceNotes.forEach((n) => log(`         ~ ${n}`));
+                const missing = missingLabel();
                 upsertMissionRow(
                     rowKey, name,
-                    unfilled > 0 ? `Dispatched (${selectedIds.length}), Missing ${unfilled}` : `Dispatched (${selectedIds.length})`,
-                    unfilled > 0 ? 'missing' : 'dispatched'
+                    missing ? `Dispatched (${selectedIds.length}), ${missing}` : `Dispatched (${selectedIds.length})`,
+                    missing ? 'missing' : 'dispatched'
                 );
                 dispatchedCount++;
                 // Don't fully trust this yet — a dispatch call can succeed but
