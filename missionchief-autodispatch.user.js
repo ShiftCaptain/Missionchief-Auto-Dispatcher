@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.14.2
+// @version      0.14.3
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -320,12 +320,14 @@
             });
     }
 
-    // Scheduled/special missions (fire alarms, exercises, speed traps, drills,
-    // inspections, etc.) don't have a clean dedicated API flag we've found, so
-    // this matches on caption keywords instead. Expand this list if you spot
-    // another recurring event type slipping through.
+    // Scheduled/special missions: confirmed via live data that the mission's
+    // own "sw" field (paired with a "sw_start_in" countdown) is the real,
+    // authoritative flag for this — e.g. "Traffic light failure" showed
+    // sw: true despite not matching any caption keyword. Caption keywords are
+    // kept as a fallback only for the rare case a mission lacks the field.
     const SCHEDULED_KEYWORDS = ['fire alarm', 'exercise', 'speed trap', 'training', 'drill', 'inspection'];
     function isScheduledMission(mission) {
+        if (typeof mission.sw === 'boolean') return mission.sw;
         const caption = (mission.caption || '').toLowerCase();
         return SCHEDULED_KEYWORDS.some((kw) => caption.includes(kw));
     }
