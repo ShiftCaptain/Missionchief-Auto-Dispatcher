@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.17.0
+// @version      0.17.1
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -1187,46 +1187,62 @@
 
         // ── Post-batch verification ──────────────────────────────────────
         // Re-check every vehicle we just dispatched: did it actually land on
-        // THIS mission immediately, or did the game queue it as a follow-up
-        // for later? If it didn't land immediately, stop trusting it as
-        // committed so the next batch tries a different vehicle instead of
-        // assuming the slot is filled.
+        // THIS mission, or did the game queue it as a follow-up for later?
+        // A single quick check was producing false negatives — a multi-vehicle
+        // dispatch can take longer than 2s to fully process server-side, and
+        // treating "not landed yet" as "never landed" was throwing away good
+        // dispatches. Retries at increasing delays before finally giving up.
         if (verifyQueue.length && isRunning) {
-            await sleep(2000); // give the game a moment to settle
-            try {
-                const recheck = await fetchVehicles();
-                const recheckById = new Map(recheck.map((v) => [v.id, v]));
+            const RETRY_DELAYS_MS = [2000, 3000, 5000]; // cumulative: checks at 2s, 5s, 10s
+            let pending = verifyQueue.map((rec) => ({ ...rec, remainingIds: [...rec.ids] }));
 
-                for (const rec of verifyQueue) {
-                    const flagged = [];
-                    for (const id of rec.ids) {
-                        const v = recheckById.get(id);
-                        const landedImmediately = v && v.target_type === 'mission' && v.target_id === rec.mid;
-                        if (!landedImmediately) flagged.push({ id, v });
+            for (const delay of RETRY_DELAYS_MS) {
+                if (!pending.length || !isRunning) break;
+                await sleep(delay);
+                try {
+                    const recheck = await fetchVehicles();
+                    const recheckById = new Map(recheck.map((v) => [v.id, v]));
+                    const stillPending = [];
+
+                    for (const rec of pending) {
+                        const notYetLanded = [];
+                        for (const id of rec.remainingIds) {
+                            const v = recheckById.get(id);
+                            const landedImmediately = v && v.target_type === 'mission' && v.target_id === rec.mid;
+                            if (!landedImmediately) notYetLanded.push(id);
+                        }
+                        if (notYetLanded.length) {
+                            stillPending.push({ ...rec, remainingIds: notYetLanded });
+                        }
                     }
-                    if (!flagged.length) continue;
-
-                    const track = missionTrack[rec.sig];
-                    if (track) flagged.forEach((f) => track.delete(f.id));
-
-                    flagged.forEach((f) => {
-                        const vv = f.v;
-                        const desc = vv
-                            ? `${vv.caption || f.id} (now target=${vv.target_type || 'none'}/${vv.target_id ?? '-'}, queued=${vv.queued_mission_id ?? '-'})`
-                            : `vehicle ${f.id} (not found on recheck)`;
-                        log(`  WARN  ${rec.name} [type ${rec.mtid}] -> ${desc} did NOT land immediately — treating as not dispatched`);
-                    });
-
-                    const confirmedCount = rec.ids.length - flagged.length;
-                    const totalMissing = rec.unfilledAtDispatch + flagged.length;
-                    upsertMissionRow(
-                        rec.rowKey, rec.name,
-                        confirmedCount > 0 ? `Dispatched (${confirmedCount}), Missing ${totalMissing}` : `Missing ${totalMissing}`,
-                        confirmedCount > 0 ? 'missing' : 'noUnits'
-                    );
+                    pending = stillPending;
+                } catch (e) {
+                    log(`Network error during dispatch verification: ${e.message}`);
                 }
-            } catch (e) {
-                log(`Network error during dispatch verification: ${e.message}`);
+            }
+
+            // Anything still unconfirmed after all retries: genuinely didn't land.
+            for (const rec of pending) {
+                const track = missionTrack[rec.sig];
+                if (track) rec.remainingIds.forEach((id) => track.delete(id));
+
+                const finalCheck = await fetchVehicles().catch(() => []);
+                const finalById = new Map(finalCheck.map((v) => [v.id, v]));
+                rec.remainingIds.forEach((id) => {
+                    const vv = finalById.get(id);
+                    const desc = vv
+                        ? `${vv.caption || id} (now target=${vv.target_type || 'none'}/${vv.target_id ?? '-'}, queued=${vv.queued_mission_id ?? '-'})`
+                        : `vehicle ${id} (not found on recheck)`;
+                    log(`  WARN  ${rec.name} [type ${rec.mtid}] -> ${desc} did NOT land after retries — treating as not dispatched`);
+                });
+
+                const confirmedCount = rec.ids.length - rec.remainingIds.length;
+                const totalMissing = rec.unfilledAtDispatch + rec.remainingIds.length;
+                upsertMissionRow(
+                    rec.rowKey, rec.name,
+                    confirmedCount > 0 ? `Dispatched (${confirmedCount}), Missing ${totalMissing}` : `Missing ${totalMissing}`,
+                    confirmedCount > 0 ? 'missing' : 'noUnits'
+                );
             }
         }
 
