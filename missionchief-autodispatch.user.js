@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.17.1
+// @version      0.18.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -388,17 +388,32 @@
         return raw;
     }
 
+    // Rebuilt from a live Network capture of a REAL manual dispatch — the
+    // previous version only sent vehicle_ids[] plus an X-CSRF-Token header,
+    // which the server accepted (200/302, no error) but silently did nothing
+    // with. A real dispatch is a genuine form POST (Sec-Fetch-Mode: navigate,
+    // not XHR) carrying the full Rails form field set below. Missing most of
+    // these fields is the most likely reason vehicles never actually landed
+    // despite every request appearing to succeed.
     async function dispatchVehicles(missionId, vehicleIds) {
         const token = getCsrfToken();
         const params = new URLSearchParams();
+        params.append('utf8', '\u2713'); // ✓ — Rails' hidden UTF-8 form marker
+        params.append('authenticity_token', token || '');
+        params.append('commit', 'Dispatch');
+        params.append('sonderrechte', '1'); // lights & sirens, matches manual dispatch default
+        params.append('next_mission', '0');
+        params.append('next_mission_id', '0');
+        params.append('alliance_mission_publish', '0');
+        params.append('sk', 'ac');
+        params.append('sd', 'd');
         vehicleIds.forEach((id) => params.append('vehicle_ids[]', id));
-        const res = await fetch(`/missions/${missionId}/alarm`, {
+
+        const res = await fetch(`/missions/${missionId}/alarm?sd=d&sk=ac`, {
             method: 'POST',
             credentials: 'same-origin',
             headers: {
                 'Content-Type': 'application/x-www-form-urlencoded',
-                'X-Requested-With': 'XMLHttpRequest',
-                ...(token ? { 'X-CSRF-Token': token } : {}),
             },
             body: params.toString(),
         });
