@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.15.0
+// @version      0.16.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -189,6 +189,7 @@
     const DEFAULT_SETTINGS = {
         dispatchAllianceCalls: false,
         dispatchScheduledCalls: true,
+        reassignCloserUnits: false, // opt-in: cancels an en-route unit if a meaningfully closer one becomes available
     };
     function getSettings() {
         const raw = GM_getValue('mc_settings', null);
@@ -393,6 +394,19 @@
                 ...(token ? { 'X-CSRF-Token': token } : {}),
             },
             body: params.toString(),
+        });
+        return res.ok;
+    }
+
+    // Confirmed via a live Network capture of clicking "Cancel" on a
+    // dispatched vehicle: GET /vehicles/{id}/backalarm?return=mission_js&sd=d&sk=ac
+    // (sd/sk appear to be static params, not per-request tokens). Recalls a
+    // vehicle that's currently en route back to its station, clearing its
+    // mission assignment.
+    async function cancelVehicleDispatch(vehicleId) {
+        const res = await fetch(`/vehicles/${vehicleId}/backalarm?return=mission_js&sd=d&sk=ac`, {
+            credentials: 'same-origin',
+            headers: { 'X-Requested-With': 'XMLHttpRequest' },
         });
         return res.ok;
     }
@@ -749,6 +763,61 @@
     const state = { links: {}, einsaetze: {}, buildingCoords: {} };
     let isRunning = false;
 
+    // Opt-in only (Settings toggle, default off): recalls an EN ROUTE vehicle
+    // (fms_real === 3 — never touches ones already on scene) if a confirmed
+    // at-station vehicle of the same type is meaningfully closer. Doesn't
+    // redispatch in the same pass — just cancels and lets the next batch's
+    // normal delta-fill logic pick up the freed requirement with the closer
+    // unit. Margin thresholds and a per-batch cap guard against thrashing
+    // (constantly swapping over marginal, noise-level distance differences).
+    async function runReassignmentPass(missions, vehicles) {
+        const REASSIGN_MIN_RATIO = 0.8; // candidate must be at most 80% of the en-route unit's distance
+        const REASSIGN_MIN_KM = 1;      // and at least 1km closer in absolute terms
+        const MAX_REASSIGNS_PER_BATCH = 5;
+
+        const atStation = vehicles.filter((v) => (v.fms_real ?? v.fms_show) === 1);
+        let swaps = 0;
+
+        for (const mission of missions) {
+            if (swaps >= MAX_REASSIGNS_PER_BATCH) break;
+            const mlat = mission.latitude || 0;
+            const mlon = mission.longitude || 0;
+            const mid = mission.id;
+
+            const enRoute = vehicles.filter((v) =>
+                v.fms_real === 3 && v.target_type === 'mission' && v.target_id === mid
+            );
+            if (!enRoute.length) continue;
+
+            for (const ev of enRoute) {
+                if (swaps >= MAX_REASSIGNS_PER_BATCH) break;
+
+                const [evLat, evLon] = state.buildingCoords[ev.building_id] || [0, 0];
+                const evDist = haversineKm(evLat, evLon, mlat, mlon);
+
+                let best = null;
+                let bestDist = Infinity;
+                for (const c of atStation) {
+                    if (c.vehicle_type !== ev.vehicle_type || c.id === ev.id) continue;
+                    const [clat, clon] = state.buildingCoords[c.building_id] || [0, 0];
+                    const d = haversineKm(clat, clon, mlat, mlon);
+                    if (d < bestDist) { bestDist = d; best = c; }
+                }
+
+                if (best && bestDist <= evDist * REASSIGN_MIN_RATIO && (evDist - bestDist) >= REASSIGN_MIN_KM) {
+                    const success = await cancelVehicleDispatch(ev.id);
+                    log(success
+                        ? `  REASSIGN ${mission.caption || mid}: recalled ${ev.caption || ev.id} (${evDist.toFixed(1)}km) — ${best.caption || best.id} is closer (${bestDist.toFixed(1)}km), will dispatch next batch`
+                        : `  REASSIGN ${mission.caption || mid}: FAILED to recall ${ev.caption || ev.id}`);
+                    if (success) swaps++;
+                    await sleep(CONFIG.dispatchDelayMs);
+                }
+            }
+        }
+
+        if (swaps > 0) log(`Reassignment pass complete — ${swaps} unit(s) recalled for closer replacements.`);
+    }
+
     async function runBatch() {
         log('Fetching missions and vehicles...');
         let missions, vehicles;
@@ -790,6 +859,10 @@
             return totalOf(mtA) - totalOf(mtB);
         });
         missions = missions.slice(0, CONFIG.missionsPerRun);
+
+        if (settings.reassignCloserUnits) {
+            await runReassignmentPass(missions, vehicles);
+        }
 
         let dispatchedCount = 0;
         const usedIds = new Set();
@@ -1316,6 +1389,10 @@
                         <input type="checkbox" id="mc-setting-scheduled" style="all:revert; margin-top:2px; flex-shrink:0;">
                         <span>Dispatch to Scheduled/Special Calls<br><span style="color:#888; font-size:11px;">Fire alarms, exercises, speed traps, drills, inspections, and similar events.</span></span>
                     </label>
+                    <label style="all:unset; display:flex; align-items:flex-start; gap:8px; margin-top:16px; cursor:pointer; color:#333; font:12px/1.4 Arial, Helvetica, sans-serif;">
+                        <input type="checkbox" id="mc-setting-reassign" style="all:revert; margin-top:2px; flex-shrink:0;">
+                        <span>Reassign to Closer Units <span style="color:#c62828; font-weight:bold;">(experimental)</span><br><span style="color:#888; font-size:11px;">Recalls an en-route unit if a confirmed closer one becomes available, freeing it to be redispatched next batch. Never touches units already on scene. Uses an unofficially-confirmed cancel endpoint — watch the console log closely after enabling.</span></span>
+                    </label>
 
                     <div style="all:unset; display:block; margin-top:20px; padding-top:14px; border-top:1px solid #eee;">
                         <div style="all:unset; display:block; font-weight:bold; color:#222; margin-bottom:4px;">Task Forces</div>
@@ -1388,6 +1465,7 @@
         const overlay = panel.querySelector('#mc-settings-overlay');
         const allianceCheckbox = panel.querySelector('#mc-setting-alliance');
         const scheduledCheckbox = panel.querySelector('#mc-setting-scheduled');
+        const reassignCheckbox = panel.querySelector('#mc-setting-reassign');
         const taskforceList = panel.querySelector('#mc-taskforce-list');
         const taskforceNameInput = panel.querySelector('#mc-taskforce-name-input');
         const taskforceInput = panel.querySelector('#mc-taskforce-input');
@@ -1536,6 +1614,7 @@
             const s = getSettings();
             allianceCheckbox.checked = s.dispatchAllianceCalls;
             scheduledCheckbox.checked = s.dispatchScheduledCalls;
+            reassignCheckbox.checked = s.reassignCloserUnits;
             renderTaskForces();
             renderMappingList(personnelList, getPersonnelMappings, setPersonnelMappings);
             renderMappingList(resourceList, getResourceMappings, setResourceMappings);
@@ -1582,6 +1661,12 @@
             s.dispatchScheduledCalls = scheduledCheckbox.checked;
             setSettings(s);
             log(`Setting changed: Dispatch to Scheduled/Special Calls = ${s.dispatchScheduledCalls}`);
+        });
+        reassignCheckbox.addEventListener('change', () => {
+            const s = getSettings();
+            s.reassignCloserUnits = reassignCheckbox.checked;
+            setSettings(s);
+            log(`Setting changed: Reassign to Closer Units = ${s.reassignCloserUnits}`);
         });
     }
 
