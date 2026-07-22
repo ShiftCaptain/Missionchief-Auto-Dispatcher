@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.14.3
+// @version      0.15.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -717,17 +717,32 @@
         return slots;
     }
 
+    // No live vehicle position data exists anywhere in the API (confirmed —
+    // no polling endpoint fires even after watching Network for 2+ minutes).
+    // Distance can only ever be approximated via the vehicle's HOME STATION
+    // location. That's exact for state 1 (truly at the station) but just a
+    // guess for state 2 (returning from a previous call — could be much
+    // closer or farther than its station in reality). Rather than treat both
+    // as equally trustworthy, prefer confirmed-accurate state-1 candidates
+    // first, only falling back to state-2 approximations when nothing state-1
+    // is available.
     function nearestVehicleForSlot(available, acceptableTypes, missionLat, missionLon, usedIds, buildingCoords) {
         const candidates = available.filter((v) => !usedIds.has(v.id) && acceptableTypes.includes(v.vehicle_type));
         if (!candidates.length) return null;
-        let best = null;
-        let bestDist = Infinity;
-        for (const v of candidates) {
-            const [lat, lon] = buildingCoords[v.building_id] || [0, 0];
-            const d = haversineKm(lat, lon, missionLat, missionLon);
-            if (d < bestDist) { bestDist = d; best = v; }
+
+        function nearestOf(pool) {
+            let best = null;
+            let bestDist = Infinity;
+            for (const v of pool) {
+                const [lat, lon] = buildingCoords[v.building_id] || [0, 0];
+                const d = haversineKm(lat, lon, missionLat, missionLon);
+                if (d < bestDist) { bestDist = d; best = v; }
+            }
+            return best;
         }
-        return best;
+
+        const atStation = candidates.filter((v) => (v.fms_real ?? v.fms_show) === 1);
+        return nearestOf(atStation.length ? atStation : candidates);
     }
 
     // ── Main batch ────────────────────────────────────────────────────────
