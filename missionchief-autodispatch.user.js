@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.16.0
+// @version      0.17.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -25,11 +25,17 @@
     };
 
     // ── Utilities ─────────────────────────────────────────────────────────
-    // log() is now console-only — the visible panel shows a structured
-    // mission status list instead (see upsertMissionRow below), matching
-    // MissionChief's own Radio panel look rather than a scrolling console.
+    // log() writes to the real console AND a capped in-memory buffer — the
+    // panel shows a structured mission status list day-to-day (see
+    // upsertMissionRow below), but the buffer backs the "View Console Log"
+    // button in Settings for anyone who doesn't want to open DevTools.
+    const LOG_BUFFER_MAX = 1000;
+    const logBuffer = [];
     function log(msg) {
-        console.log(`[${new Date().toLocaleTimeString()}] ${msg}`);
+        const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        console.log(line);
+        logBuffer.push(line);
+        if (logBuffer.length > LOG_BUFFER_MAX) logBuffer.shift();
     }
 
     // Status -> color used for both the badge and the status text
@@ -57,7 +63,7 @@
             `;
             row.innerHTML = `
                 <span class="mc-badge" style="all:unset; display:inline-block; width:10px; height:10px; border-radius:2px; flex-shrink:0;"></span>
-                <span class="mc-title" style="all:unset; flex:1 1 auto; color:#222; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+                <span class="mc-title" style="all:unset; flex:1 1 auto; color:var(--mc-text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
                 <span class="mc-status" style="all:unset; flex-shrink:0; font-weight:bold; white-space:nowrap;"></span>
             `;
             rowsContainer.appendChild(row);
@@ -190,6 +196,7 @@
         dispatchAllianceCalls: false,
         dispatchScheduledCalls: true,
         reassignCloserUnits: false, // opt-in: cancels an en-route unit if a meaningfully closer one becomes available
+        darkMode: false,
     };
     function getSettings() {
         const raw = GM_getValue('mc_settings', null);
@@ -1316,6 +1323,36 @@
         }));
     }
 
+    // Light/dark palettes applied as CSS custom properties on the panel root.
+    // Custom properties are the one thing the "all: unset/initial" isolation
+    // trick doesn't reset, so this is what lets every themed element update
+    // live without rebuilding the panel's HTML.
+    const THEMES = {
+        light: {
+            bg: '#fff', border: '#b5b5b5', text: '#222', subtext: '#888',
+            toolbarBg: '#f7f7f7', toolbarBorder: '#ddd',
+            timerBg: '#f2f2f2', timerBorder: '#ddd', timerText: '#555',
+            btnBg: '#f2f2f2', btnText: '#333', btnBorder: '#c8c8c8',
+            rowBorder: '#eee', listRowBg: '#f7f7f7', listRowBorder: '#e5e5e5',
+            inputBg: '#fff', inputBorder: '#c8c8c8',
+        },
+        dark: {
+            bg: '#1e1e1e', border: '#444', text: '#eee', subtext: '#999',
+            toolbarBg: '#2a2a2a', toolbarBorder: '#444',
+            timerBg: '#2a2a2a', timerBorder: '#444', timerText: '#aaa',
+            btnBg: '#333', btnText: '#eee', btnBorder: '#555',
+            rowBorder: '#333', listRowBg: '#2a2a2a', listRowBorder: '#444',
+            inputBg: '#2a2a2a', inputBorder: '#555',
+        },
+    };
+    function applyTheme(dark) {
+        if (!panelEl) return;
+        const t = dark ? THEMES.dark : THEMES.light;
+        for (const [k, v] of Object.entries(t)) {
+            panelEl.style.setProperty(`--mc-${k}`, v);
+        }
+    }
+
     function buildPanel() {
         const panel = document.createElement('div');
         panelEl = panel;
@@ -1336,14 +1373,14 @@
             all: initial; position: fixed; left: ${left}px; top: ${top}px;
             width: ${width}px; height: ${height}px; min-width: 260px; min-height: 220px;
             display: flex; flex-direction: column;
-            background: #fff; border: 1px solid #b5b5b5; border-radius: 5px;
+            background: var(--mc-bg); border: 1px solid var(--mc-border); border-radius: 5px;
             box-shadow: 0 2px 12px rgba(0,0,0,0.35); z-index: 999999;
             font-family: Arial, Helvetica, sans-serif; overflow: hidden;
         `;
 
         const btnStyle = `
             all: unset; box-sizing: border-box; flex: 1; text-align: center;
-            background: #f2f2f2; color: #333; border: 1px solid #c8c8c8;
+            background: var(--mc-btn-bg); color: var(--mc-btn-text); border: 1px solid var(--mc-btn-border);
             border-radius: 3px; padding: 5px 4px; cursor: pointer;
             font: 12px/1.2 Arial, Helvetica, sans-serif; user-select: none;
         `;
@@ -1355,16 +1392,16 @@
                 <span style="color:#fff;">MC Auto-Dispatch v2</span>
                 <span id="mc-status" style="font-weight:bold; color:#ffd1d1;">STOPPED</span>
             </div>
-            <div style="all:unset; display:flex; gap:6px; padding:8px; box-sizing:border-box; width:100%; background:#f7f7f7; border-bottom:1px solid #ddd; flex-shrink:0;">
+            <div style="all:unset; display:flex; gap:6px; padding:8px; box-sizing:border-box; width:100%; background:var(--mc-toolbar-bg); border-bottom:1px solid var(--mc-toolbar-border); flex-shrink:0;">
                 <button id="mc-start" style="${btnStyle}">Start</button>
                 <button id="mc-stop" style="${btnStyle}">Stop</button>
                 <button id="mc-import" style="${btnStyle}">Import Cache</button>
                 <button id="mc-settings-btn" style="${btnStyle}">Settings</button>
             </div>
             <div id="mc-rows" style="all:unset; display:block; box-sizing:border-box; width:100%;
-                 flex: 1 1 auto; min-height: 60px; background:#fff; overflow-y:auto;"></div>
+                 flex: 1 1 auto; min-height: 60px; background:var(--mc-bg); overflow-y:auto;"></div>
             <div id="mc-timer" style="all:unset; display:block; box-sizing:border-box; width:100%;
-                 padding:5px 10px; background:#f2f2f2; border-top:1px solid #ddd; color:#555;
+                 padding:5px 10px; background:var(--mc-timer-bg); border-top:1px solid var(--mc-timer-border); color:var(--mc-timer-text);
                  font:11px/1.3 Arial, Helvetica, sans-serif; text-align:center; flex-shrink:0;">Idle</div>
             <div id="mc-resize" title="Drag to resize" style="position:absolute; right:2px; bottom:2px; width:14px; height:14px;
                  cursor: nwse-resize; background:
@@ -1373,7 +1410,7 @@
             <input type="file" id="mc-file-input" multiple accept=".json" style="display:none;">
 
             <div id="mc-settings-overlay" style="all:unset; position:absolute; inset:0; display:none;
-                 flex-direction:column; background:#fff; z-index:10; font-family:Arial, Helvetica, sans-serif;">
+                 flex-direction:column; background:var(--mc-bg); z-index:10; font-family:Arial, Helvetica, sans-serif;">
                 <div style="all:unset; display:flex; justify-content:space-between; align-items:center;
                      padding:6px 10px; background:linear-gradient(#e0483a,#c0392b); color:#fff;
                      font:bold 13px/1.3 Arial, Helvetica, sans-serif; flex-shrink:0;">
@@ -1381,67 +1418,58 @@
                     <span id="mc-settings-close" style="cursor:pointer; color:#fff; font-weight:bold; padding:0 6px; font-size:16px; line-height:1;">&times;</span>
                 </div>
                 <div style="all:unset; display:block; padding:14px; overflow-y:auto; flex:1 1 auto; box-sizing:border-box; width:100%;">
-                    <label style="all:unset; display:flex; align-items:flex-start; gap:8px; margin-bottom:16px; cursor:pointer; color:#333; font:12px/1.4 Arial, Helvetica, sans-serif;">
+                    <div style="all:unset; display:flex; gap:8px; margin-bottom:16px;">
+                        <button id="mc-view-log-btn" style="${btnStyle} flex:1;">View Console Log</button>
+                    </div>
+                    <label style="all:unset; display:flex; align-items:flex-start; gap:8px; margin-bottom:16px; cursor:pointer; color:var(--mc-text); font:12px/1.4 Arial, Helvetica, sans-serif;">
+                        <input type="checkbox" id="mc-setting-darkmode" style="all:revert; margin-top:2px; flex-shrink:0;">
+                        <span>Dark Mode<br><span style="color:var(--mc-subtext); font-size:11px;">Switches the panel to a dark theme.</span></span>
+                    </label>
+                    <label style="all:unset; display:flex; align-items:flex-start; gap:8px; margin-bottom:16px; cursor:pointer; color:var(--mc-text); font:12px/1.4 Arial, Helvetica, sans-serif;">
                         <input type="checkbox" id="mc-setting-alliance" style="all:revert; margin-top:2px; flex-shrink:0;">
-                        <span>Dispatch to Alliance Calls<br><span style="color:#888; font-size:11px;">Include missions belonging to your alliance, not just your own department.</span></span>
+                        <span>Dispatch to Alliance Calls<br><span style="color:var(--mc-subtext); font-size:11px;">Include missions belonging to your alliance, not just your own department.</span></span>
                     </label>
-                    <label style="all:unset; display:flex; align-items:flex-start; gap:8px; cursor:pointer; color:#333; font:12px/1.4 Arial, Helvetica, sans-serif;">
+                    <label style="all:unset; display:flex; align-items:flex-start; gap:8px; cursor:pointer; color:var(--mc-text); font:12px/1.4 Arial, Helvetica, sans-serif;">
                         <input type="checkbox" id="mc-setting-scheduled" style="all:revert; margin-top:2px; flex-shrink:0;">
-                        <span>Dispatch to Scheduled/Special Calls<br><span style="color:#888; font-size:11px;">Fire alarms, exercises, speed traps, drills, inspections, and similar events.</span></span>
+                        <span>Dispatch to Scheduled/Special Calls<br><span style="color:var(--mc-subtext); font-size:11px;">Fire alarms, exercises, speed traps, drills, inspections, and similar events.</span></span>
                     </label>
-                    <label style="all:unset; display:flex; align-items:flex-start; gap:8px; margin-top:16px; cursor:pointer; color:#333; font:12px/1.4 Arial, Helvetica, sans-serif;">
+                    <label style="all:unset; display:flex; align-items:flex-start; gap:8px; margin-top:16px; cursor:pointer; color:var(--mc-text); font:12px/1.4 Arial, Helvetica, sans-serif;">
                         <input type="checkbox" id="mc-setting-reassign" style="all:revert; margin-top:2px; flex-shrink:0;">
-                        <span>Reassign to Closer Units <span style="color:#c62828; font-weight:bold;">(experimental)</span><br><span style="color:#888; font-size:11px;">Recalls an en-route unit if a confirmed closer one becomes available, freeing it to be redispatched next batch. Never touches units already on scene. Uses an unofficially-confirmed cancel endpoint — watch the console log closely after enabling.</span></span>
+                        <span>Reassign to Closer Units <span style="color:#c62828; font-weight:bold;">(experimental)</span><br><span style="color:var(--mc-subtext); font-size:11px;">Recalls an en-route unit if a confirmed closer one becomes available, freeing it to be redispatched next batch. Never touches units already on scene. Uses an unofficially-confirmed cancel endpoint — watch the console log closely after enabling.</span></span>
                     </label>
 
-                    <div style="all:unset; display:block; margin-top:20px; padding-top:14px; border-top:1px solid #eee;">
-                        <div style="all:unset; display:block; font-weight:bold; color:#222; margin-bottom:4px;">Task Forces</div>
-                        <div style="all:unset; display:block; color:#888; font-size:11px; margin-bottom:10px;">
+                    <div style="all:unset; display:block; margin-top:20px; padding-top:14px; border-top:1px solid var(--mc-row-border);">
+                        <div style="all:unset; display:block; font-weight:bold; color:var(--mc-text); margin-bottom:4px;">Task Forces</div>
+                        <div style="all:unset; display:block; color:var(--mc-subtext); font-size:11px; margin-bottom:10px;">
                             Vehicles that should always be dispatched together. When any member is sent to a call, the others go too if available.
                         </div>
                         <div id="mc-taskforce-list" style="all:unset; display:block; margin-bottom:10px;"></div>
                         <input type="text" id="mc-taskforce-name-input" placeholder="Task force name (e.g. Truck Company 4)"
-                               style="all:revert; box-sizing:border-box; width:100%; padding:5px 6px; border:1px solid #c8c8c8; border-radius:3px; font:12px Arial, Helvetica, sans-serif; margin-bottom:6px;">
+                               style="all:revert; box-sizing:border-box; width:100%; padding:5px 6px; border:1px solid var(--mc-input-border); border-radius:3px; font:12px Arial, Helvetica, sans-serif; margin-bottom:6px; background:var(--mc-input-bg); color:var(--mc-text);">
                         <div style="all:unset; display:flex; gap:6px;">
                             <input type="text" id="mc-taskforce-input" placeholder="PSF - Engine 4, PSF - Ladder 1"
-                                   style="all:revert; flex:1 1 auto; box-sizing:border-box; padding:5px 6px; border:1px solid #c8c8c8; border-radius:3px; font:12px Arial, Helvetica, sans-serif;">
+                                   style="all:revert; flex:1 1 auto; box-sizing:border-box; padding:5px 6px; border:1px solid var(--mc-input-border); border-radius:3px; font:12px Arial, Helvetica, sans-serif; background:var(--mc-input-bg); color:var(--mc-text);">
                             <button id="mc-taskforce-add" style="${btnStyle} flex:0 0 auto; width:56px;">Add</button>
                         </div>
                     </div>
+                </div>
 
-                    <div style="all:unset; display:block; margin-top:20px; padding-top:14px; border-top:1px solid #eee;">
-                        <div style="all:unset; display:block; font-weight:bold; color:#222; margin-bottom:4px;">Personnel Certifications <span style="font-weight:normal; color:#999;">(optional)</span></div>
-                        <div style="all:unset; display:block; color:#888; font-size:11px; margin-bottom:10px;">
-                            The bot checks nearby vehicles' actual crew training automatically — no setup required. Only add a mapping here if you want to narrow the search to a specific vehicle class (e.g. "HazMat" → "hazmat vehicles") for speed.
-                        </div>
-                        <div id="mc-personnel-list" style="all:unset; display:block; margin-bottom:10px;"></div>
-                        <div style="all:unset; display:flex; gap:6px;">
-                            <input type="text" id="mc-personnel-cert-input" placeholder="Certification (e.g. HazMat)"
-                                   style="all:revert; flex:1 1 auto; box-sizing:border-box; padding:5px 6px; border:1px solid #c8c8c8; border-radius:3px; font:12px Arial, Helvetica, sans-serif;">
-                            <input type="text" id="mc-personnel-class-input" placeholder="Vehicle class (e.g. hazmat vehicles)"
-                                   style="all:revert; flex:1 1 auto; box-sizing:border-box; padding:5px 6px; border:1px solid #c8c8c8; border-radius:3px; font:12px Arial, Helvetica, sans-serif;">
-                            <button id="mc-personnel-add" style="${btnStyle} flex:0 0 auto; width:56px;">Add</button>
-                        </div>
+                <div id="mc-log-overlay" style="all:unset; position:absolute; inset:0; display:none;
+                     flex-direction:column; background:var(--mc-bg); z-index:11; font-family:Arial, Helvetica, sans-serif;">
+                    <div style="all:unset; display:flex; justify-content:space-between; align-items:center;
+                         padding:6px 10px; background:linear-gradient(#e0483a,#c0392b); color:#fff;
+                         font:bold 13px/1.3 Arial, Helvetica, sans-serif; flex-shrink:0;">
+                        <span style="color:#fff;">Console Log</span>
+                        <span id="mc-log-close" style="cursor:pointer; color:#fff; font-weight:bold; padding:0 6px; font-size:16px; line-height:1;">&times;</span>
                     </div>
-
-                    <div style="all:unset; display:block; margin-top:20px; padding-top:14px; border-top:1px solid #eee;">
-                        <div style="all:unset; display:block; font-weight:bold; color:#222; margin-bottom:4px;">Resource Needs <span style="font-weight:normal; color:#999;">(optional)</span></div>
-                        <div style="all:unset; display:block; color:#888; font-size:11px; margin-bottom:10px;">
-                            The bot auto-matches against your links.json class names and verifies actual carried capacity (e.g. "Water amount") on the vehicle. Only add a mapping here if the resource keyword doesn't naturally match any class name.
-                        </div>
-                        <div id="mc-resource-list" style="all:unset; display:block; margin-bottom:10px;"></div>
-                        <div style="all:unset; display:flex; gap:6px;">
-                            <input type="text" id="mc-resource-key-input" placeholder="Resource (e.g. foam)"
-                                   style="all:revert; flex:1 1 auto; box-sizing:border-box; padding:5px 6px; border:1px solid #c8c8c8; border-radius:3px; font:12px Arial, Helvetica, sans-serif;">
-                            <input type="text" id="mc-resource-class-input" placeholder="Vehicle class (e.g. water tankers)"
-                                   style="all:revert; flex:1 1 auto; box-sizing:border-box; padding:5px 6px; border:1px solid #c8c8c8; border-radius:3px; font:12px Arial, Helvetica, sans-serif;">
-                            <button id="mc-resource-add" style="${btnStyle} flex:0 0 auto; width:56px;">Add</button>
-                        </div>
-                    </div>
+                    <pre id="mc-log-content" style="all:unset; display:block; box-sizing:border-box; width:100%; flex:1 1 auto;
+                         margin:0; padding:8px; overflow-y:auto; background:#111; color:#8fd68f; font:11px/1.4 'Consolas','Courier New',monospace;
+                         white-space:pre-wrap; word-break:break-word;"></pre>
                 </div>
             </div>
         `;
         document.body.appendChild(panel);
+        applyTheme(getSettings().darkMode);
 
         rowsContainer = panel.querySelector('#mc-rows');
         statusEl = panel.querySelector('#mc-status');
@@ -1466,6 +1494,10 @@
         const allianceCheckbox = panel.querySelector('#mc-setting-alliance');
         const scheduledCheckbox = panel.querySelector('#mc-setting-scheduled');
         const reassignCheckbox = panel.querySelector('#mc-setting-reassign');
+        const darkModeCheckbox = panel.querySelector('#mc-setting-darkmode');
+        const logOverlay = panel.querySelector('#mc-log-overlay');
+        const logContent = panel.querySelector('#mc-log-content');
+        let logRefreshInterval = null;
         const taskforceList = panel.querySelector('#mc-taskforce-list');
         const taskforceNameInput = panel.querySelector('#mc-taskforce-name-input');
         const taskforceInput = panel.querySelector('#mc-taskforce-input');
@@ -1475,7 +1507,7 @@
             taskforceList.innerHTML = '';
             if (!groups.length) {
                 const empty = document.createElement('div');
-                empty.style.cssText = 'all:unset; display:block; color:#999; font-size:11px; font-style:italic;';
+                empty.style.cssText = 'all:unset; display:block; color:var(--mc-subtext); font-size:11px; font-style:italic;';
                 empty.textContent = 'No task forces yet.';
                 taskforceList.appendChild(empty);
                 return;
@@ -1484,18 +1516,18 @@
                 const row = document.createElement('div');
                 row.style.cssText = `
                     all:unset; display:flex; align-items:center; justify-content:space-between; gap:8px;
-                    padding:5px 8px; margin-bottom:4px; background:#f7f7f7; border:1px solid #e5e5e5;
-                    border-radius:3px; font-size:11px; color:#333;
+                    padding:5px 8px; margin-bottom:4px; background:var(--mc-list-row-bg); border:1px solid var(--mc-list-row-border);
+                    border-radius:3px; font-size:11px; color:var(--mc-text);
                 `;
                 const label = document.createElement('span');
                 label.innerHTML = '';
                 label.style.cssText = 'all:unset; flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
                 const nameSpan = document.createElement('span');
                 nameSpan.textContent = group.name;
-                nameSpan.style.cssText = 'all:unset; font-weight:bold; color:#222;';
+                nameSpan.style.cssText = 'all:unset; font-weight:bold; color:var(--mc-text);';
                 const membersSpan = document.createElement('span');
                 membersSpan.textContent = `: ${group.members.join(' + ')}`;
-                membersSpan.style.cssText = 'all:unset; color:#666;';
+                membersSpan.style.cssText = 'all:unset; color:var(--mc-subtext);';
                 label.appendChild(nameSpan);
                 label.appendChild(membersSpan);
                 const removeBtn = document.createElement('span');
@@ -1533,119 +1565,43 @@
             renderTaskForces();
         }
 
-        // Shared renderer for the two "keyword -> vehicle class" mapping lists
-        // (Personnel Certifications, Resource Needs) — same row/remove-button
-        // pattern as Task Forces, just simpler entries.
-        function renderMappingList(listEl, getFn, setFn) {
-            const mappings = getFn();
-            listEl.innerHTML = '';
-            if (!mappings.length) {
-                const empty = document.createElement('div');
-                empty.style.cssText = 'all:unset; display:block; color:#999; font-size:11px; font-style:italic;';
-                empty.textContent = 'None defined yet.';
-                listEl.appendChild(empty);
-                return;
-            }
-            mappings.forEach((m, idx) => {
-                const row = document.createElement('div');
-                row.style.cssText = `
-                    all:unset; display:flex; align-items:center; justify-content:space-between; gap:8px;
-                    padding:5px 8px; margin-bottom:4px; background:#f7f7f7; border:1px solid #e5e5e5;
-                    border-radius:3px; font-size:11px; color:#333;
-                `;
-                const label = document.createElement('span');
-                label.textContent = `${m.key} → ${m.vehicleClass}`;
-                label.style.cssText = 'all:unset; flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#333;';
-                const removeBtn = document.createElement('span');
-                removeBtn.textContent = '×';
-                removeBtn.title = 'Remove';
-                removeBtn.style.cssText = 'all:unset; cursor:pointer; color:#c62828; font-weight:bold; padding:0 4px; flex-shrink:0;';
-                removeBtn.addEventListener('click', () => {
-                    const current = getFn();
-                    current.splice(idx, 1);
-                    setFn(current);
-                    renderMappingList(listEl, getFn, setFn);
-                });
-                row.appendChild(label);
-                row.appendChild(removeBtn);
-                listEl.appendChild(row);
-            });
-        }
-
-        const personnelList = panel.querySelector('#mc-personnel-list');
-        const personnelCertInput = panel.querySelector('#mc-personnel-cert-input');
-        const personnelClassInput = panel.querySelector('#mc-personnel-class-input');
-
-        function addPersonnelMapping() {
-            const key = personnelCertInput.value.trim();
-            const vehicleClass = personnelClassInput.value.trim();
-            if (!key || !vehicleClass) {
-                log('Personnel mapping needs both a certification and a vehicle class.');
-                return;
-            }
-            const mappings = getPersonnelMappings();
-            mappings.push({ key, vehicleClass });
-            setPersonnelMappings(mappings);
-            personnelCertInput.value = '';
-            personnelClassInput.value = '';
-            renderMappingList(personnelList, getPersonnelMappings, setPersonnelMappings);
-        }
-
-        const resourceList = panel.querySelector('#mc-resource-list');
-        const resourceKeyInput = panel.querySelector('#mc-resource-key-input');
-        const resourceClassInput = panel.querySelector('#mc-resource-class-input');
-
-        function addResourceMapping() {
-            const key = resourceKeyInput.value.trim();
-            const vehicleClass = resourceClassInput.value.trim();
-            if (!key || !vehicleClass) {
-                log('Resource mapping needs both a resource keyword and a vehicle class.');
-                return;
-            }
-            const mappings = getResourceMappings();
-            mappings.push({ key, vehicleClass });
-            setResourceMappings(mappings);
-            resourceKeyInput.value = '';
-            resourceClassInput.value = '';
-            renderMappingList(resourceList, getResourceMappings, setResourceMappings);
-        }
-
         function openSettings() {
             const s = getSettings();
             allianceCheckbox.checked = s.dispatchAllianceCalls;
             scheduledCheckbox.checked = s.dispatchScheduledCalls;
             reassignCheckbox.checked = s.reassignCloserUnits;
+            darkModeCheckbox.checked = s.darkMode;
             renderTaskForces();
-            renderMappingList(personnelList, getPersonnelMappings, setPersonnelMappings);
-            renderMappingList(resourceList, getResourceMappings, setResourceMappings);
             overlay.style.display = 'flex';
         }
         function closeSettings() {
             overlay.style.display = 'none';
         }
 
+        function refreshLogContent() {
+            logContent.textContent = logBuffer.join('\n');
+            logContent.scrollTop = logContent.scrollHeight;
+        }
+        function openLogViewer() {
+            refreshLogContent();
+            logOverlay.style.display = 'flex';
+            logRefreshInterval = setInterval(refreshLogContent, 1000);
+        }
+        function closeLogViewer() {
+            logOverlay.style.display = 'none';
+            if (logRefreshInterval) { clearInterval(logRefreshInterval); logRefreshInterval = null; }
+        }
+
         panel.querySelector('#mc-settings-btn').addEventListener('click', openSettings);
         panel.querySelector('#mc-settings-close').addEventListener('click', closeSettings);
+        panel.querySelector('#mc-view-log-btn').addEventListener('click', openLogViewer);
+        panel.querySelector('#mc-log-close').addEventListener('click', closeLogViewer);
         panel.querySelector('#mc-taskforce-add').addEventListener('click', addTaskForce);
         taskforceNameInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') addTaskForce();
         });
         taskforceInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') addTaskForce();
-        });
-        panel.querySelector('#mc-personnel-add').addEventListener('click', addPersonnelMapping);
-        personnelCertInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') addPersonnelMapping();
-        });
-        personnelClassInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') addPersonnelMapping();
-        });
-        panel.querySelector('#mc-resource-add').addEventListener('click', addResourceMapping);
-        resourceKeyInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') addResourceMapping();
-        });
-        resourceClassInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') addResourceMapping();
         });
 
         // Saved immediately on change — takes effect on the next batch,
@@ -1667,6 +1623,13 @@
             s.reassignCloserUnits = reassignCheckbox.checked;
             setSettings(s);
             log(`Setting changed: Reassign to Closer Units = ${s.reassignCloserUnits}`);
+        });
+        darkModeCheckbox.addEventListener('change', () => {
+            const s = getSettings();
+            s.darkMode = darkModeCheckbox.checked;
+            setSettings(s);
+            applyTheme(s.darkMode);
+            log(`Setting changed: Dark Mode = ${s.darkMode}`);
         });
     }
 
