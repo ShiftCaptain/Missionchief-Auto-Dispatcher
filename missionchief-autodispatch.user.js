@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.18.0
+// @version      0.18.1
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -826,13 +826,23 @@
                     if (d < bestDist) { bestDist = d; best = c; }
                 }
 
-                if (best && bestDist <= evDist * REASSIGN_MIN_RATIO && (evDist - bestDist) >= REASSIGN_MIN_KM) {
+                if (!best) {
+                    log(`  REASSIGN-CHECK ${mission.caption || mid}: ${ev.caption || ev.id} en route (${evDist.toFixed(1)}km) — no confirmed at-station vehicle of type ${ev.vehicle_type} found anywhere`);
+                    continue;
+                }
+
+                const meetsRatio = bestDist <= evDist * REASSIGN_MIN_RATIO;
+                const meetsAbsolute = (evDist - bestDist) >= REASSIGN_MIN_KM;
+
+                if (best && meetsRatio && meetsAbsolute) {
                     const success = await cancelVehicleDispatch(ev.id);
                     log(success
                         ? `  REASSIGN ${mission.caption || mid}: recalled ${ev.caption || ev.id} (${evDist.toFixed(1)}km) — ${best.caption || best.id} is closer (${bestDist.toFixed(1)}km), will dispatch next batch`
                         : `  REASSIGN ${mission.caption || mid}: FAILED to recall ${ev.caption || ev.id}`);
                     if (success) swaps++;
                     await sleep(CONFIG.dispatchDelayMs);
+                } else {
+                    log(`  REASSIGN-CHECK ${mission.caption || mid}: ${ev.caption || ev.id} en route (${evDist.toFixed(1)}km) vs. closest at-station ${best.caption || best.id} (${bestDist.toFixed(1)}km) — ratio ${(bestDist / evDist).toFixed(2)} (need <=${REASSIGN_MIN_RATIO}), diff ${(evDist - bestDist).toFixed(1)}km (need >=${REASSIGN_MIN_KM}km) — not close enough to swap`);
                 }
             }
         }
