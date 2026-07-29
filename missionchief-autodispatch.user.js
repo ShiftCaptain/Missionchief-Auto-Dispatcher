@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.19.0
+// @version      0.19.1
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -394,16 +394,19 @@
     // Sec-Fetch-Mode: navigate / Sec-Fetch-Dest: iframe with a Referer
     // matching the mission's own page — a fetch() POST can only ever send
     // Sec-Fetch-Mode: cors with the wrong Referer (our script runs in the
-    // outer page, not inside the mission's iframe). If the server checks
-    // either of those, fetch() is structurally incapable of succeeding here
-    // regardless of how correct the form body is — which matches what we
-    // saw: every field matched, still never landed.
+    // outer page, not inside the mission's iframe). Real fix: create an
+    // actual hidden iframe, navigate it to the mission's own page (correct
+    // origin/context), then build and submit a real <form> from inside that
+    // iframe's document — a genuine navigation with correct headers.
     //
-    // Real fix: create an actual hidden iframe, navigate it to the mission's
-    // own page (correct origin/context), then build and submit a real <form>
-    // from inside that iframe's document. That's a genuine navigation with
-    // correct headers, not an approximation of one.
-    async function dispatchVehicles(missionId, vehicleIds) {
+    // Dispatches ONE vehicle per call. The only confirmed-real capture we
+    // have showed exactly one vehicle_ids[] value in the form body — we'd
+    // been assuming multiple vehicles ride in a single combined POST, but
+    // that was never actually confirmed, and multi-vehicle dispatches kept
+    // silently failing even with an otherwise-correct real navigation. This
+    // matches the one shape we know for certain is real, rather than
+    // extrapolating from it.
+    async function dispatchSingleVehicle(missionId, vehicleId) {
         return new Promise((resolve) => {
             const iframe = document.createElement('iframe');
             iframe.style.display = 'none';
@@ -451,7 +454,7 @@
                     addField('alliance_mission_publish', '0');
                     addField('sk', 'ac');
                     addField('sd', 'd');
-                    vehicleIds.forEach((id) => addField('vehicle_ids[]', id));
+                    addField('vehicle_ids[]', vehicleId); // exactly one, matching the confirmed-real capture
 
                     idoc.body.appendChild(form);
 
@@ -470,6 +473,18 @@
 
             iframe.src = `/missions/${missionId}?sd=d&sk=ac`;
         });
+    }
+
+    // Dispatches each vehicle as its own separate navigation/submission,
+    // sequentially. Returns true only if every vehicle's submission completed.
+    async function dispatchVehicles(missionId, vehicleIds) {
+        let allOk = true;
+        for (const vehicleId of vehicleIds) {
+            const ok = await dispatchSingleVehicle(missionId, vehicleId);
+            if (!ok) allOk = false;
+            await sleep(500); // brief gap between sequential navigations
+        }
+        return allOk;
     }
 
     // Confirmed via a live Network capture of clicking "Cancel" on a
