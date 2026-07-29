@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.19.1
+// @version      0.19.2
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -492,12 +492,45 @@
     // (sd/sk appear to be static params, not per-request tokens). Recalls a
     // vehicle that's currently en route back to its station, clearing its
     // mission assignment.
+    //
+    // Rebuilt the same way dispatch was: a plain fetch() has the identical
+    // structural problem — it can't send Sec-Fetch-Mode: navigate or the
+    // correct Referer, both of which a real click produces. This loads the
+    // vehicle's own page first (correct same-origin context), then navigates
+    // that same iframe away to the cancel URL — a genuine second navigation
+    // with the right Referer, not an approximation of one.
     async function cancelVehicleDispatch(vehicleId) {
-        const res = await fetch(`/vehicles/${vehicleId}/backalarm?return=mission_js&sd=d&sk=ac`, {
-            credentials: 'same-origin',
-            headers: { 'X-Requested-With': 'XMLHttpRequest' },
+        return new Promise((resolve) => {
+            const iframe = document.createElement('iframe');
+            iframe.style.display = 'none';
+            document.body.appendChild(iframe);
+
+            let settled = false;
+            function finish(result) {
+                if (settled) return;
+                settled = true;
+                setTimeout(() => iframe.remove(), 500);
+                resolve(result);
+            }
+
+            const safetyTimeout = setTimeout(() => finish(false), 10000);
+
+            iframe.addEventListener('load', function onVehiclePageLoad() {
+                iframe.removeEventListener('load', onVehiclePageLoad);
+
+                iframe.addEventListener('load', function onCancelComplete() {
+                    iframe.removeEventListener('load', onCancelComplete);
+                    clearTimeout(safetyTimeout);
+                    finish(true);
+                });
+
+                // Real navigation away from the vehicle's own page — correct
+                // Referer/Sec-Fetch-Mode context, same reasoning as dispatch.
+                iframe.src = `/vehicles/${vehicleId}/backalarm?return=mission_js&sd=d&sk=ac`;
+            });
+
+            iframe.src = `/vehicles/${vehicleId}?sd=d&sk=ac`;
         });
-        return res.ok;
     }
 
     // ── Cache auto-builder (mirrors build_cache_entry from the Python bot) ──
