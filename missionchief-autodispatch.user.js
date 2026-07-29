@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.18.2
+// @version      0.19.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -388,36 +388,88 @@
         return raw;
     }
 
-    // Rebuilt from a live Network capture of a REAL manual dispatch — the
-    // previous version only sent vehicle_ids[] plus an X-CSRF-Token header,
-    // which the server accepted (200/302, no error) but silently did nothing
-    // with. A real dispatch is a genuine form POST (Sec-Fetch-Mode: navigate,
-    // not XHR) carrying the full Rails form field set below. Missing most of
-    // these fields is the most likely reason vehicles never actually landed
-    // despite every request appearing to succeed.
+    // fetch() cannot replicate a real browser navigation: Sec-Fetch-Mode,
+    // Sec-Fetch-Dest, and Referer are all browser-controlled and forbidden
+    // for scripts to override. A live capture showed the real dispatch as
+    // Sec-Fetch-Mode: navigate / Sec-Fetch-Dest: iframe with a Referer
+    // matching the mission's own page — a fetch() POST can only ever send
+    // Sec-Fetch-Mode: cors with the wrong Referer (our script runs in the
+    // outer page, not inside the mission's iframe). If the server checks
+    // either of those, fetch() is structurally incapable of succeeding here
+    // regardless of how correct the form body is — which matches what we
+    // saw: every field matched, still never landed.
+    //
+    // Real fix: create an actual hidden iframe, navigate it to the mission's
+    // own page (correct origin/context), then build and submit a real <form>
+    // from inside that iframe's document. That's a genuine navigation with
+    // correct headers, not an approximation of one.
     async function dispatchVehicles(missionId, vehicleIds) {
-        const token = getCsrfToken();
-        const params = new URLSearchParams();
-        params.append('utf8', '\u2713'); // ✓ — Rails' hidden UTF-8 form marker
-        params.append('authenticity_token', token || '');
-        params.append('commit', 'Dispatch');
-        params.append('sonderrechte', '1'); // lights & sirens, matches manual dispatch default
-        params.append('next_mission', '0');
-        params.append('next_mission_id', '0');
-        params.append('alliance_mission_publish', '0');
-        params.append('sk', 'ac');
-        params.append('sd', 'd');
-        vehicleIds.forEach((id) => params.append('vehicle_ids[]', id));
+        return new Promise((resolve) => {
+            const iframe = document.createElement('iframe');
+            iframe.style.display = 'none';
+            document.body.appendChild(iframe);
 
-        const res = await fetch(`/missions/${missionId}/alarm?sd=d&sk=ac`, {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-            },
-            body: params.toString(),
+            let settled = false;
+            function finish(result) {
+                if (settled) return;
+                settled = true;
+                setTimeout(() => iframe.remove(), 500);
+                resolve(result);
+            }
+
+            const safetyTimeout = setTimeout(() => finish(false), 10000);
+
+            iframe.addEventListener('load', function onMissionPageLoad() {
+                iframe.removeEventListener('load', onMissionPageLoad);
+                try {
+                    const idoc = iframe.contentDocument;
+
+                    // Prefer the token actually embedded in this mission page's
+                    // own form/meta over our outer page's token, in case Rails
+                    // uses per-page tokens.
+                    const tokenInput = idoc.querySelector('input[name="authenticity_token"]');
+                    const tokenMeta = idoc.querySelector('meta[name="csrf-token"]');
+                    const token = tokenInput ? tokenInput.value : (tokenMeta ? tokenMeta.content : getCsrfToken());
+
+                    const form = idoc.createElement('form');
+                    form.method = 'POST';
+                    form.action = `/missions/${missionId}/alarm?sd=d&sk=ac`;
+
+                    function addField(name, value) {
+                        const input = idoc.createElement('input');
+                        input.type = 'hidden';
+                        input.name = name;
+                        input.value = value;
+                        form.appendChild(input);
+                    }
+                    addField('utf8', '\u2713');
+                    addField('authenticity_token', token || '');
+                    addField('commit', 'Dispatch');
+                    addField('sonderrechte', '1');
+                    addField('next_mission', '0');
+                    addField('next_mission_id', '0');
+                    addField('alliance_mission_publish', '0');
+                    addField('sk', 'ac');
+                    addField('sd', 'd');
+                    vehicleIds.forEach((id) => addField('vehicle_ids[]', id));
+
+                    idoc.body.appendChild(form);
+
+                    iframe.addEventListener('load', function onDispatchComplete() {
+                        iframe.removeEventListener('load', onDispatchComplete);
+                        clearTimeout(safetyTimeout);
+                        finish(true);
+                    });
+
+                    form.submit();
+                } catch (e) {
+                    clearTimeout(safetyTimeout);
+                    finish(false);
+                }
+            });
+
+            iframe.src = `/missions/${missionId}?sd=d&sk=ac`;
         });
-        return res.ok;
     }
 
     // Confirmed via a live Network capture of clicking "Cancel" on a
