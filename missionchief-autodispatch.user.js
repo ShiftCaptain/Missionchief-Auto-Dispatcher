@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.18.1
+// @version      0.18.2
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -785,6 +785,29 @@
     const state = { links: {}, einsaetze: {}, buildingCoords: {} };
     let isRunning = false;
 
+    // Builds type -> Set(equivalent types) from links.json: any two type IDs
+    // that appear together in the same class (e.g. firetrucks: [0,1,30,13,18])
+    // are treated as interchangeable for reassignment purposes. Without this,
+    // comparing raw vehicle_type numbers misses valid replacements — e.g. an
+    // en-route type-0 engine would never match an at-station type-1 engine
+    // even though both are "firetrucks" in your fleet.
+    function buildTypeEquivalenceMap(links) {
+        const classesByType = new Map();
+        for (const [cls, typeIds] of Object.entries(links)) {
+            for (const t of typeIds) {
+                if (!classesByType.has(t)) classesByType.set(t, new Set());
+                classesByType.get(t).add(cls);
+            }
+        }
+        const equivalents = new Map();
+        for (const [t, classes] of classesByType) {
+            const eqSet = new Set([t]);
+            classes.forEach((cls) => (links[cls] || []).forEach((other) => eqSet.add(other)));
+            equivalents.set(t, eqSet);
+        }
+        return equivalents;
+    }
+
     // Opt-in only (Settings toggle, default off): recalls an EN ROUTE vehicle
     // (fms_real === 3 — never touches ones already on scene) if a confirmed
     // at-station vehicle of the same type is meaningfully closer. Doesn't
@@ -798,6 +821,7 @@
         const MAX_REASSIGNS_PER_BATCH = 5;
 
         const atStation = vehicles.filter((v) => (v.fms_real ?? v.fms_show) === 1);
+        const typeEquivalents = buildTypeEquivalenceMap(state.links);
         let swaps = 0;
 
         for (const mission of missions) {
@@ -816,18 +840,19 @@
 
                 const [evLat, evLon] = state.buildingCoords[ev.building_id] || [0, 0];
                 const evDist = haversineKm(evLat, evLon, mlat, mlon);
+                const acceptableTypes = typeEquivalents.get(ev.vehicle_type) || new Set([ev.vehicle_type]);
 
                 let best = null;
                 let bestDist = Infinity;
                 for (const c of atStation) {
-                    if (c.vehicle_type !== ev.vehicle_type || c.id === ev.id) continue;
+                    if (!acceptableTypes.has(c.vehicle_type) || c.id === ev.id) continue;
                     const [clat, clon] = state.buildingCoords[c.building_id] || [0, 0];
                     const d = haversineKm(clat, clon, mlat, mlon);
                     if (d < bestDist) { bestDist = d; best = c; }
                 }
 
                 if (!best) {
-                    log(`  REASSIGN-CHECK ${mission.caption || mid}: ${ev.caption || ev.id} en route (${evDist.toFixed(1)}km) — no confirmed at-station vehicle of type ${ev.vehicle_type} found anywhere`);
+                    log(`  REASSIGN-CHECK ${mission.caption || mid}: ${ev.caption || ev.id} en route (${evDist.toFixed(1)}km) — no confirmed at-station vehicle of an equivalent class (type ${ev.vehicle_type}) found anywhere`);
                     continue;
                 }
 
