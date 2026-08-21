@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.19.2
+// @version      0.19.3
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -388,149 +388,74 @@
         return raw;
     }
 
-    // fetch() cannot replicate a real browser navigation: Sec-Fetch-Mode,
-    // Sec-Fetch-Dest, and Referer are all browser-controlled and forbidden
-    // for scripts to override. A live capture showed the real dispatch as
-    // Sec-Fetch-Mode: navigate / Sec-Fetch-Dest: iframe with a Referer
-    // matching the mission's own page — a fetch() POST can only ever send
-    // Sec-Fetch-Mode: cors with the wrong Referer (our script runs in the
-    // outer page, not inside the mission's iframe). Real fix: create an
-    // actual hidden iframe, navigate it to the mission's own page (correct
-    // origin/context), then build and submit a real <form> from inside that
-    // iframe's document — a genuine navigation with correct headers.
-    //
-    // Dispatches ONE vehicle per call. The only confirmed-real capture we
-    // have showed exactly one vehicle_ids[] value in the form body — we'd
-    // been assuming multiple vehicles ride in a single combined POST, but
-    // that was never actually confirmed, and multi-vehicle dispatches kept
-    // silently failing even with an otherwise-correct real navigation. This
-    // matches the one shape we know for certain is real, rather than
-    // extrapolating from it.
+    // Reverted from a hidden-iframe navigation approach: loading MissionChief's
+    // own mission/vehicle pages inside a hidden iframe risked triggering
+    // frame-busting (a common anti-clickjacking measure where a page detects
+    // it's inside an unexpected iframe and forces the whole tab to navigate),
+    // which showed up as the game's entire UI briefly disappearing every
+    // dispatch. That's a real, visible disruption to a live game — not
+    // acceptable even if it might have fixed delivery. Back to fetch(), still
+    // using the exact field set confirmed from a live capture of a real
+    // dispatch. Sends ONE vehicle per call — the only confirmed-real capture
+    // showed exactly one vehicle_ids[] value, never confirmed multiple ride
+    // in one request.
     async function dispatchSingleVehicle(missionId, vehicleId) {
-        return new Promise((resolve) => {
-            const iframe = document.createElement('iframe');
-            iframe.style.display = 'none';
-            document.body.appendChild(iframe);
+        const idoc = document; // use the outer page's own token; per-form tokens are a still-open question
+        const tokenInput = idoc.querySelector('input[name="authenticity_token"]');
+        const tokenMeta = idoc.querySelector('meta[name="csrf-token"]');
+        const token = tokenInput ? tokenInput.value : (tokenMeta ? tokenMeta.content : getCsrfToken());
 
-            let settled = false;
-            function finish(result) {
-                if (settled) return;
-                settled = true;
-                setTimeout(() => iframe.remove(), 500);
-                resolve(result);
-            }
+        const params = new URLSearchParams();
+        params.append('utf8', '\u2713');
+        params.append('authenticity_token', token || '');
+        params.append('commit', 'Dispatch');
+        params.append('sonderrechte', '1');
+        params.append('next_mission', '0');
+        params.append('next_mission_id', '0');
+        params.append('alliance_mission_publish', '0');
+        params.append('sk', 'ac');
+        params.append('sd', 'd');
+        params.append('vehicle_ids[]', vehicleId);
 
-            const safetyTimeout = setTimeout(() => finish(false), 10000);
-
-            iframe.addEventListener('load', function onMissionPageLoad() {
-                iframe.removeEventListener('load', onMissionPageLoad);
-                try {
-                    const idoc = iframe.contentDocument;
-
-                    // Prefer the token actually embedded in this mission page's
-                    // own form/meta over our outer page's token, in case Rails
-                    // uses per-page tokens.
-                    const tokenInput = idoc.querySelector('input[name="authenticity_token"]');
-                    const tokenMeta = idoc.querySelector('meta[name="csrf-token"]');
-                    const token = tokenInput ? tokenInput.value : (tokenMeta ? tokenMeta.content : getCsrfToken());
-
-                    const form = idoc.createElement('form');
-                    form.method = 'POST';
-                    form.action = `/missions/${missionId}/alarm?sd=d&sk=ac`;
-
-                    function addField(name, value) {
-                        const input = idoc.createElement('input');
-                        input.type = 'hidden';
-                        input.name = name;
-                        input.value = value;
-                        form.appendChild(input);
-                    }
-                    addField('utf8', '\u2713');
-                    addField('authenticity_token', token || '');
-                    addField('commit', 'Dispatch');
-                    addField('sonderrechte', '1');
-                    addField('next_mission', '0');
-                    addField('next_mission_id', '0');
-                    addField('alliance_mission_publish', '0');
-                    addField('sk', 'ac');
-                    addField('sd', 'd');
-                    addField('vehicle_ids[]', vehicleId); // exactly one, matching the confirmed-real capture
-
-                    idoc.body.appendChild(form);
-
-                    iframe.addEventListener('load', function onDispatchComplete() {
-                        iframe.removeEventListener('load', onDispatchComplete);
-                        clearTimeout(safetyTimeout);
-                        finish(true);
-                    });
-
-                    form.submit();
-                } catch (e) {
-                    clearTimeout(safetyTimeout);
-                    finish(false);
-                }
+        try {
+            const res = await fetch(`/missions/${missionId}/alarm?sd=d&sk=ac`, {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: params.toString(),
             });
-
-            iframe.src = `/missions/${missionId}?sd=d&sk=ac`;
-        });
+            return res.ok;
+        } catch (e) {
+            return false;
+        }
     }
 
-    // Dispatches each vehicle as its own separate navigation/submission,
-    // sequentially. Returns true only if every vehicle's submission completed.
+    // Dispatches each vehicle as its own separate request, sequentially.
+    // Returns true only if every vehicle's request completed without error.
     async function dispatchVehicles(missionId, vehicleIds) {
         let allOk = true;
         for (const vehicleId of vehicleIds) {
             const ok = await dispatchSingleVehicle(missionId, vehicleId);
             if (!ok) allOk = false;
-            await sleep(500); // brief gap between sequential navigations
+            await sleep(500);
         }
         return allOk;
     }
 
     // Confirmed via a live Network capture of clicking "Cancel" on a
     // dispatched vehicle: GET /vehicles/{id}/backalarm?return=mission_js&sd=d&sk=ac
-    // (sd/sk appear to be static params, not per-request tokens). Recalls a
-    // vehicle that's currently en route back to its station, clearing its
-    // mission assignment.
-    //
-    // Rebuilt the same way dispatch was: a plain fetch() has the identical
-    // structural problem — it can't send Sec-Fetch-Mode: navigate or the
-    // correct Referer, both of which a real click produces. This loads the
-    // vehicle's own page first (correct same-origin context), then navigates
-    // that same iframe away to the cancel URL — a genuine second navigation
-    // with the right Referer, not an approximation of one.
+    // Reverted to fetch() for the same reason as dispatch above — the
+    // iframe-navigation version risked frame-busting and visible UI disruption.
     async function cancelVehicleDispatch(vehicleId) {
-        return new Promise((resolve) => {
-            const iframe = document.createElement('iframe');
-            iframe.style.display = 'none';
-            document.body.appendChild(iframe);
-
-            let settled = false;
-            function finish(result) {
-                if (settled) return;
-                settled = true;
-                setTimeout(() => iframe.remove(), 500);
-                resolve(result);
-            }
-
-            const safetyTimeout = setTimeout(() => finish(false), 10000);
-
-            iframe.addEventListener('load', function onVehiclePageLoad() {
-                iframe.removeEventListener('load', onVehiclePageLoad);
-
-                iframe.addEventListener('load', function onCancelComplete() {
-                    iframe.removeEventListener('load', onCancelComplete);
-                    clearTimeout(safetyTimeout);
-                    finish(true);
-                });
-
-                // Real navigation away from the vehicle's own page — correct
-                // Referer/Sec-Fetch-Mode context, same reasoning as dispatch.
-                iframe.src = `/vehicles/${vehicleId}/backalarm?return=mission_js&sd=d&sk=ac`;
+        try {
+            const res = await fetch(`/vehicles/${vehicleId}/backalarm?return=mission_js&sd=d&sk=ac`, {
+                credentials: 'same-origin',
+                headers: { 'X-Requested-With': 'XMLHttpRequest' },
             });
-
-            iframe.src = `/vehicles/${vehicleId}?sd=d&sk=ac`;
-        });
+            return res.ok;
+        } catch (e) {
+            return false;
+        }
     }
 
     // ── Cache auto-builder (mirrors build_cache_entry from the Python bot) ──
