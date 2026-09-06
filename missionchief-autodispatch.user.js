@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.19.3
+// @version      0.20.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -139,7 +139,7 @@
         "ambulance": [5, 27],
         "water tankers": [7],
         "hazmat vehicles": [9],
-        "police cars": [10, 19, 26],
+        "police cars": [10],
         "mobile command vehicles": [12],
         "mobile air vehicles": [6],
         "k-9 units": [19],
@@ -466,14 +466,29 @@
         const name = mtype.name || mtype.caption || `Mission ${mtid}`;
         const rawReqs = mtype.requirements || {};
         const skipKeywords = ['water', 'water needed', 'oneof'];
+        const linkKeys = Object.keys(links);
 
         const reqs = [];
         for (const [className, qty] of Object.entries(rawReqs)) {
             let cls = className.toLowerCase().replace(/_/g, ' ');
             if (skipKeywords.some((kw) => cls.includes(kw))) continue;
+
             if (!(cls in links)) {
-                const matched = Object.keys(links).find((k) => k.toLowerCase() === cls);
-                if (matched) cls = matched; else continue;
+                // Exact match failed — try substring matching in either
+                // direction (e.g. a raw key like "police_supervisor" or
+                // "ems_chief_units" should still connect to class names like
+                // "sheriff supervisor units" or "ems chief" without needing
+                // the exact wording to line up).
+                const matched = linkKeys.find((k) => {
+                    const kLower = k.toLowerCase();
+                    return kLower.includes(cls) || cls.includes(kLower);
+                });
+                if (matched) {
+                    cls = matched;
+                } else {
+                    log(`  CACHE WARN: requirement key '${className}' (mission type ${mtid}) has no matching vehicle class in links.json — this requirement will never be dispatched. Add a class named close to '${cls}', or check for a naming mismatch.`);
+                    continue;
+                }
             }
             reqs.push({ requirement: cls, qty: String(qty) });
         }
@@ -1348,6 +1363,34 @@
         state.links = getLinks();
         if (!Object.keys(state.links).length) {
             log('  WARNING: no vehicle class links loaded. Use "Import Cache" to load your links.json first.');
+        }
+
+        // One-time migration: your stored "police cars" class previously
+        // included K-9 (19) and SWAT SUV (26) alongside plain patrol cars,
+        // meaning generic police-car requirements could pull scarce
+        // specialty units. K-9 and SWAT keep their own dedicated classes —
+        // this just narrows "police cars" to plain patrol units automatically.
+        if (!GM_getValue('mc_links_migrated_v1', false) && Array.isArray(state.links['police cars'])) {
+            const before = state.links['police cars'];
+            const after = before.filter((t) => t !== 19 && t !== 26);
+            if (after.length !== before.length) {
+                state.links['police cars'] = after;
+                setLinks(state.links);
+                log(`  One-time migration: narrowed "police cars" from [${before.join(', ')}] to [${after.join(', ')}] — K-9/SWAT no longer count as generic patrol cars.`);
+            }
+            GM_setValue('mc_links_migrated_v1', true);
+        }
+
+        // One-time migration: mission types cached before the fuzzy
+        // class-matching fix may be missing requirement lines that failed to
+        // match back then (e.g. police supervisor / EMS chief units) and
+        // were silently dropped. Clearing the cache once forces every
+        // mission type to rebuild itself against the improved matching the
+        // next time it's encountered — automatic, no action needed.
+        if (!GM_getValue('mc_cache_migrated_v2', false)) {
+            setMissionReqs({});
+            GM_setValue('mc_cache_migrated_v2', true);
+            log('  One-time migration: cleared cached mission requirements so they rebuild with improved class matching.');
         }
 
         let batchNum = 1;
