@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.22.1
+// @version      0.23.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -1078,9 +1078,19 @@
         });
         missions = missions.slice(0, CONFIG.missionsPerRun);
 
-        if (settings.reassignCloserUnits) {
-            await runReassignmentPass(missions, vehicles);
-        }
+        // Reassignment is disabled regardless of the stored setting.
+        // cancelVehicleDispatch() never received the same fix dispatch did —
+        // dispatch was silently failing because it used the wrong CSRF token
+        // (outer page's instead of the mission-specific one); cancel likely
+        // has the identical problem and was never verified after that was
+        // discovered. A cancel call that "succeeds" (res.ok) without actually
+        // freeing the vehicle in-game means the bot starts believing units
+        // are available that are still genuinely busy elsewhere — which then
+        // shows up as an unrelated mission's dispatch reaching for a much
+        // farther unit while the real closer one sits (wrongly) marked busy.
+        // if (settings.reassignCloserUnits) {
+        //     await runReassignmentPass(missions, vehicles);
+        // }
 
         let dispatchedCount = 0;
         const usedIds = new Set();
@@ -1514,6 +1524,19 @@
             log('  One-time migration: cleared cached mission requirements so they rebuild with improved class matching.');
         }
 
+        // One-time migration: reset reassignCloserUnits if it was previously
+        // enabled — the feature is disabled in code now, but this keeps the
+        // stored setting honest in case it's ever re-enabled later.
+        if (!GM_getValue('mc_reassign_migrated_v1', false)) {
+            const s = getSettings();
+            if (s.reassignCloserUnits) {
+                s.reassignCloserUnits = false;
+                setSettings(s);
+                log('  One-time migration: reset "Reassign to Closer Units" — it was interfering with normal dispatch availability tracking.');
+            }
+            GM_setValue('mc_reassign_migrated_v1', true);
+        }
+
         let batchNum = 1;
         while (isRunning) {
             log(`-- Batch #${batchNum} --`);
@@ -1688,9 +1711,9 @@
                         <input type="checkbox" id="mc-setting-scheduled" style="all:revert; margin-top:2px; flex-shrink:0;">
                         <span>Dispatch to Scheduled/Special Calls<br><span style="color:var(--mc-subtext); font-size:11px;">Fire alarms, exercises, speed traps, drills, inspections, and similar events.</span></span>
                     </label>
-                    <label style="all:unset; display:flex; align-items:flex-start; gap:8px; margin-top:16px; cursor:pointer; color:var(--mc-text); font:12px/1.4 Arial, Helvetica, sans-serif;">
-                        <input type="checkbox" id="mc-setting-reassign" style="all:revert; margin-top:2px; flex-shrink:0;">
-                        <span>Reassign to Closer Units <span style="color:#c62828; font-weight:bold;">(experimental)</span><br><span style="color:var(--mc-subtext); font-size:11px;">Recalls an en-route unit if a confirmed closer one becomes available, freeing it to be redispatched next batch. Never touches units already on scene. Uses an unofficially-confirmed cancel endpoint — watch the console log closely after enabling.</span></span>
+                    <label style="all:unset; display:flex; align-items:flex-start; gap:8px; margin-top:16px; color:var(--mc-subtext); font:12px/1.4 Arial, Helvetica, sans-serif; opacity:0.6;">
+                        <input type="checkbox" id="mc-setting-reassign" disabled style="all:revert; margin-top:2px; flex-shrink:0;">
+                        <span>Reassign to Closer Units <span style="color:#c62828; font-weight:bold;">(disabled)</span><br><span style="color:var(--mc-subtext); font-size:11px;">Turned off — its cancel action was never confirmed to actually work, and it was causing genuinely-free vehicles to appear busy for unrelated missions.</span></span>
                     </label>
 
                     <div style="all:unset; display:block; margin-top:20px; padding-top:14px; border-top:1px solid var(--mc-row-border);">
