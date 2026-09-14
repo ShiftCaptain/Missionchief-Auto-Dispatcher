@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.20.1
+// @version      0.20.2
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -1722,12 +1722,24 @@
         }
 
         function refreshLogContent() {
+            // Only force scroll-to-bottom if the user was already near the
+            // bottom (i.e. "following" the live log). If they've scrolled up
+            // to read history, leave their position alone — auto-scrolling
+            // regardless of position made it impossible to ever read back.
+            const NEAR_BOTTOM_PX = 40;
+            const wasNearBottom =
+                logContent.scrollHeight - logContent.scrollTop - logContent.clientHeight <= NEAR_BOTTOM_PX;
+
             logContent.textContent = logBuffer.join('\n');
-            logContent.scrollTop = logContent.scrollHeight;
+
+            if (wasNearBottom) {
+                logContent.scrollTop = logContent.scrollHeight;
+            }
         }
         function openLogViewer() {
             refreshLogContent();
             logOverlay.style.display = 'flex';
+            logContent.scrollTop = logContent.scrollHeight; // start at the bottom (most recent) on open
             logRefreshInterval = setInterval(refreshLogContent, 1000);
         }
         function closeLogViewer() {
