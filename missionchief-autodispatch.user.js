@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.20.2
+// @version      0.21.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -388,6 +388,40 @@
         return raw;
     }
 
+    // Rails sometimes uses per-form CSRF tokens that differ from the page's
+    // global meta-tag token. We've been assuming they're the same this whole
+    // time — this fetches the mission's own page as plain HTML TEXT (a
+    // completely normal background GET, no rendering, no navigation, zero
+    // risk of the frame-busting/UI-disruption problem the iframe approach
+    // had) and reads the token actually embedded in that page's own form.
+    // Cached briefly per mission since multiple vehicles often dispatch to
+    // the same mission back-to-back.
+    const missionTokenCache = new Map(); // missionId -> { token, fetchedAt }
+    const MISSION_TOKEN_CACHE_MS = 30000;
+
+    async function fetchMissionPageToken(missionId) {
+        const cached = missionTokenCache.get(missionId);
+        if (cached && Date.now() - cached.fetchedAt < MISSION_TOKEN_CACHE_MS) return cached.token;
+
+        try {
+            const res = await fetch(`/missions/${missionId}?sd=d&sk=ac`, { credentials: 'same-origin' });
+            if (!res.ok) return null;
+            const html = await res.text();
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            const tokenInput = doc.querySelector('input[name="authenticity_token"]');
+            const tokenMeta = doc.querySelector('meta[name="csrf-token"]');
+            const token = tokenInput ? tokenInput.value : (tokenMeta ? tokenMeta.content : null);
+            const outerToken = getCsrfToken();
+            if (token && outerToken && token !== outerToken) {
+                log(`  INFO  Mission ${missionId}'s own authenticity_token differs from the outer page's meta token — using the mission-specific one`);
+            }
+            missionTokenCache.set(missionId, { token, fetchedAt: Date.now() });
+            return token;
+        } catch (e) {
+            return null;
+        }
+    }
+
     // Reverted from a hidden-iframe navigation approach: loading MissionChief's
     // own mission/vehicle pages inside a hidden iframe risked triggering
     // frame-busting (a common anti-clickjacking measure where a page detects
@@ -400,10 +434,15 @@
     // showed exactly one vehicle_ids[] value, never confirmed multiple ride
     // in one request.
     async function dispatchSingleVehicle(missionId, vehicleId) {
-        const idoc = document; // use the outer page's own token; per-form tokens are a still-open question
-        const tokenInput = idoc.querySelector('input[name="authenticity_token"]');
-        const tokenMeta = idoc.querySelector('meta[name="csrf-token"]');
-        const token = tokenInput ? tokenInput.value : (tokenMeta ? tokenMeta.content : getCsrfToken());
+        // Prefer the mission page's own embedded token; fall back to the
+        // outer page's meta tag if fetching/parsing that failed for any reason.
+        const missionToken = await fetchMissionPageToken(missionId);
+        let token = missionToken;
+        if (!token) {
+            const tokenInput = document.querySelector('input[name="authenticity_token"]');
+            const tokenMeta = document.querySelector('meta[name="csrf-token"]');
+            token = tokenInput ? tokenInput.value : (tokenMeta ? tokenMeta.content : getCsrfToken());
+        }
 
         const params = new URLSearchParams();
         params.append('utf8', '\u2713');
