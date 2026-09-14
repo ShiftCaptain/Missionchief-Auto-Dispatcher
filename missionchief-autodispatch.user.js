@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.21.0
+// @version      0.21.1
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -845,9 +845,8 @@
         const candidates = available.filter((v) => !usedIds.has(v.id) && acceptableTypes.includes(v.vehicle_type));
         if (!candidates.length) return null;
 
-        function nearestOf(pool) {
-            let best = null;
-            let bestDist = Infinity;
+        function scoreOf(pool) {
+            const scored = [];
             for (const v of pool) {
                 const coords = buildingCoords[v.building_id];
                 if (!coords) {
@@ -859,14 +858,23 @@
                     continue;
                 }
                 const [lat, lon] = coords;
-                const d = haversineKm(lat, lon, missionLat, missionLon);
-                if (d < bestDist) { bestDist = d; best = v; }
+                scored.push({ v, dist: haversineKm(lat, lon, missionLat, missionLon) });
             }
-            return best;
+            return scored.sort((a, b) => a.dist - b.dist);
         }
 
         const atStation = candidates.filter((v) => (v.fms_real ?? v.fms_show) === 1);
-        return nearestOf(atStation.length ? atStation : candidates);
+        const usingAtStationOnly = atStation.length > 0;
+        const scored = scoreOf(usingAtStationOnly ? atStation : candidates);
+        if (!scored.length) return null;
+
+        const winner = scored[0];
+        if (scored.length > 1) {
+            const others = scored.slice(1, 4).map((s) => `${s.v.caption || s.v.id} (${s.dist.toFixed(1)}km)`).join(', ');
+            const tierNote = usingAtStationOnly ? '' : ' [no confirmed at-station candidates — using approximate state-2 positions]';
+            log(`  PICK  ${winner.v.caption || winner.v.id} (${winner.dist.toFixed(1)}km)${tierNote} chosen over: ${others}${scored.length > 4 ? ', ...' : ''}`);
+        }
+        return winner.v;
     }
 
     // ── Main batch ────────────────────────────────────────────────────────
