@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.21.1
+// @version      0.22.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -832,6 +832,47 @@
         return slots;
     }
 
+    // Confirmed via live Network capture: MissionChief itself uses a public
+    // OSRM (Open Source Routing Machine) instance for its own "Distance"
+    // column, giving REAL road-route distance/time rather than straight-line.
+    // The response explicitly sends Access-Control-Allow-Origin: *, so this
+    // is directly callable via fetch() from our script — no workaround needed.
+    // Cached per coordinate pair (rounded) since the same station-to-mission
+    // query repeats often within and across batches; OSRM's own response
+    // also carries a 24h Cache-Control, so the browser cache helps too.
+    const routeDistanceCache = new Map(); // "lat1,lon1|lat2,lon2" -> { km, fetchedAt }
+    const ROUTE_CACHE_MS = 5 * 60 * 1000;
+
+    async function fetchRouteDistanceKm(lat1, lon1, lat2, lon2) {
+        const key = `${lat1.toFixed(4)},${lon1.toFixed(4)}|${lat2.toFixed(4)},${lon2.toFixed(4)}`;
+        const cached = routeDistanceCache.get(key);
+        if (cached && Date.now() - cached.fetchedAt < ROUTE_CACHE_MS) return cached.km;
+
+        try {
+            const res = await fetch(`https://osrm.missionchief.com/viaroute?loc=${lat1},${lon1}&loc=${lat2},${lon2}`);
+            if (!res.ok) return null;
+            const data = await res.json();
+            // Defensive parsing — legacy OSRM v4 ("route_summary.total_distance"
+            // in meters) is what this endpoint's naming pattern suggests, but
+            // fall back to a couple of other plausible shapes just in case.
+            let meters = null;
+            if (data?.route_summary?.total_distance != null) {
+                meters = data.route_summary.total_distance;
+            } else if (data?.routes?.[0]?.distance != null) {
+                meters = data.routes[0].distance;
+            } else if (data?.total_distance != null) {
+                meters = data.total_distance;
+            }
+            if (meters == null) return null;
+
+            const km = meters / 1000;
+            routeDistanceCache.set(key, { km, fetchedAt: Date.now() });
+            return km;
+        } catch (e) {
+            return null;
+        }
+    }
+
     // No live vehicle position data exists anywhere in the API (confirmed —
     // no polling endpoint fires even after watching Network for 2+ minutes).
     // Distance can only ever be approximated via the vehicle's HOME STATION
@@ -841,11 +882,20 @@
     // as equally trustworthy, prefer confirmed-accurate state-1 candidates
     // first, only falling back to state-2 approximations when nothing state-1
     // is available.
-    function nearestVehicleForSlot(available, acceptableTypes, missionLat, missionLon, usedIds, buildingCoords) {
+    //
+    // Selection is now two-stage: haversine (straight-line) ranks the full
+    // candidate pool cheaply, then the nearest few get their REAL road-route
+    // distance pulled from MissionChief's own OSRM instance to make the final
+    // call — real accuracy for the decision that matters, bounded call count
+    // for everything else. Falls back to the haversine ranking if OSRM calls
+    // fail for any reason.
+    async function nearestVehicleForSlot(available, acceptableTypes, missionLat, missionLon, usedIds, buildingCoords) {
+        const ROUTE_RERANK_TOP_N = 4;
+
         const candidates = available.filter((v) => !usedIds.has(v.id) && acceptableTypes.includes(v.vehicle_type));
         if (!candidates.length) return null;
 
-        function scoreOf(pool) {
+        function haversineScoreOf(pool) {
             const scored = [];
             for (const v of pool) {
                 const coords = buildingCoords[v.building_id];
@@ -858,21 +908,36 @@
                     continue;
                 }
                 const [lat, lon] = coords;
-                scored.push({ v, dist: haversineKm(lat, lon, missionLat, missionLon) });
+                scored.push({ v, lat, lon, dist: haversineKm(lat, lon, missionLat, missionLon) });
             }
             return scored.sort((a, b) => a.dist - b.dist);
         }
 
         const atStation = candidates.filter((v) => (v.fms_real ?? v.fms_show) === 1);
         const usingAtStationOnly = atStation.length > 0;
-        const scored = scoreOf(usingAtStationOnly ? atStation : candidates);
+        const scored = haversineScoreOf(usingAtStationOnly ? atStation : candidates);
         if (!scored.length) return null;
 
-        const winner = scored[0];
-        if (scored.length > 1) {
-            const others = scored.slice(1, 4).map((s) => `${s.v.caption || s.v.id} (${s.dist.toFixed(1)}km)`).join(', ');
+        // Re-rank the nearest few by real road distance.
+        const shortlist = scored.slice(0, ROUTE_RERANK_TOP_N);
+        const routed = await Promise.all(shortlist.map(async (s) => {
+            const routeKm = await fetchRouteDistanceKm(s.lat, s.lon, missionLat, missionLon);
+            return { ...s, routeKm };
+        }));
+
+        const allRouted = routed.every((r) => r.routeKm != null);
+        const finalOrder = allRouted
+            ? [...routed].sort((a, b) => a.routeKm - b.routeKm)
+            : routed; // fall back to the existing haversine order if any OSRM call failed
+
+        const winner = finalOrder[0];
+        if (finalOrder.length > 1) {
+            const others = finalOrder.slice(1, 4).map((s) =>
+                `${s.v.caption || s.v.id} (${allRouted ? s.routeKm.toFixed(1) + 'km road' : s.dist.toFixed(1) + 'km straight-line'})`
+            ).join(', ');
             const tierNote = usingAtStationOnly ? '' : ' [no confirmed at-station candidates — using approximate state-2 positions]';
-            log(`  PICK  ${winner.v.caption || winner.v.id} (${winner.dist.toFixed(1)}km)${tierNote} chosen over: ${others}${scored.length > 4 ? ', ...' : ''}`);
+            const winnerDist = allRouted ? `${winner.routeKm.toFixed(1)}km road` : `${winner.dist.toFixed(1)}km straight-line`;
+            log(`  PICK  ${winner.v.caption || winner.v.id} (${winnerDist})${tierNote} chosen over: ${others}${scored.length > ROUTE_RERANK_TOP_N ? ', ...' : ''}`);
         }
         return winner.v;
     }
@@ -1125,7 +1190,7 @@
             const selectedNames = [];
             let unfilled = 0;
             for (const acceptableTypes of slots) {
-                const v = nearestVehicleForSlot(available, acceptableTypes, mlat, mlon, usedIds, state.buildingCoords);
+                const v = await nearestVehicleForSlot(available, acceptableTypes, mlat, mlon, usedIds, state.buildingCoords);
                 if (!v) {
                     unfilled++;
                 } else {
