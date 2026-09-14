@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.23.0
+// @version      0.23.1
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -889,7 +889,7 @@
     // call — real accuracy for the decision that matters, bounded call count
     // for everything else. Falls back to the haversine ranking if OSRM calls
     // fail for any reason.
-    async function nearestVehicleForSlot(available, acceptableTypes, missionLat, missionLon, usedIds, buildingCoords) {
+    async function nearestVehicleForSlot(available, acceptableTypes, missionLat, missionLon, usedIds, buildingCoords, usedByMission) {
         const ROUTE_RERANK_TOP_N = 15; // wide enough that straight-line pre-filtering rarely excludes the real road-distance winner
 
         const candidates = available.filter((v) => !usedIds.has(v.id) && acceptableTypes.includes(v.vehicle_type));
@@ -939,6 +939,36 @@
             const winnerDist = allRouted ? `${winner.routeKm.toFixed(1)}km road` : `${winner.dist.toFixed(1)}km straight-line`;
             log(`  PICK  ${winner.v.caption || winner.v.id} (${winnerDist})${tierNote} chosen over: ${others}${scored.length > ROUTE_RERANK_TOP_N ? ', ...' : ''}`);
         }
+
+        // Cheap (haversine only, no extra OSRM calls) transparency check:
+        // were any equivalent-type vehicles claimed by a DIFFERENT mission
+        // earlier THIS SAME BATCH that looked closer than our actual winner?
+        // This turns "why didn't it use the obviously closer one" into a
+        // visible, explained outcome — real resource contention when
+        // multiple missions are active at once — instead of an unexplained
+        // mystery that looks like a selection bug.
+        if (usedByMission) {
+            const winnerDistForCompare = winner.routeKm ?? winner.dist;
+            const claimedCloser = available
+                .filter((v) => usedIds.has(v.id) && acceptableTypes.includes(v.vehicle_type))
+                .map((v) => {
+                    const coords = buildingCoords[v.building_id];
+                    if (!coords) return null;
+                    const [lat, lon] = coords;
+                    return { v, dist: haversineKm(lat, lon, missionLat, missionLon) };
+                })
+                .filter((c) => c && c.dist < winnerDistForCompare);
+
+            if (claimedCloser.length) {
+                const notes = claimedCloser
+                    .sort((a, b) => a.dist - b.dist)
+                    .slice(0, 3)
+                    .map((c) => `${c.v.caption || c.v.id} (${c.dist.toFixed(1)}km straight-line, claimed by "${usedByMission.get(c.v.id) || 'another mission'}" earlier this batch)`)
+                    .join(', ');
+                log(`  NOTE  A closer unit existed but was already claimed this batch: ${notes}`);
+            }
+        }
+
         return winner.v;
     }
 
@@ -1094,6 +1124,7 @@
 
         let dispatchedCount = 0;
         const usedIds = new Set();
+        const usedByMission = new Map(); // vehicle id -> mission caption that claimed it this batch
         const processedKeys = new Set();
         const verifyQueue = []; // successful dispatches to double-check after the batch
 
@@ -1200,12 +1231,13 @@
             const selectedNames = [];
             let unfilled = 0;
             for (const acceptableTypes of slots) {
-                const v = await nearestVehicleForSlot(available, acceptableTypes, mlat, mlon, usedIds, state.buildingCoords);
+                const v = await nearestVehicleForSlot(available, acceptableTypes, mlat, mlon, usedIds, state.buildingCoords, usedByMission);
                 if (!v) {
                     unfilled++;
                 } else {
                     selectedIds.push(v.id);
                     usedIds.add(v.id);
+                    usedByMission.set(v.id, name);
                     // Capture status at the moment of selection — if a follow-up
                     // shows up later in-game, compare that vehicle's name here
                     // against what its fms/target/queued fields looked like
@@ -1279,6 +1311,7 @@
                 if (matched) {
                     selectedIds.push(matched.id);
                     usedIds.add(matched.id);
+                    usedByMission.set(matched.id, name);
                     selectedNames.push(`${matched.caption || matched.id} (verified: crew certified in ${need.cert})`);
                     resourceNotes.push(`personnel: ${need.qty}x ${need.cert} still needed -> sent ${matched.caption || matched.id} (certification confirmed)`);
                 } else if (candidates.length) {
@@ -1314,6 +1347,7 @@
                 if (matched) {
                     selectedIds.push(matched.id);
                     usedIds.add(matched.id);
+                    usedByMission.set(matched.id, name);
                     selectedNames.push(`${matched.caption || matched.id} (verified: carries ${need.resource})`);
                     resourceNotes.push(`other: ${need.raw} still needed -> sent ${matched.caption || matched.id} (capacity confirmed)`);
                 } else if (candidates.length) {
@@ -1344,6 +1378,7 @@
                             if (partnerVehicle && !usedIds.has(partnerVehicle.id)) {
                                 selectedIds.push(partnerVehicle.id);
                                 usedIds.add(partnerVehicle.id);
+                                usedByMission.set(partnerVehicle.id, name);
                                 addedPartners.push(partnerVehicle);
                                 nextFrontier.push(partnerVehicle.id);
                             }
