@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.20.0
+// @version      0.20.1
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -810,7 +810,16 @@
             let best = null;
             let bestDist = Infinity;
             for (const v of pool) {
-                const [lat, lon] = buildingCoords[v.building_id] || [0, 0];
+                const coords = buildingCoords[v.building_id];
+                if (!coords) {
+                    // Silently defaulting to [0,0] would make this vehicle
+                    // compute as impossibly far away, causing it to lose to a
+                    // real (but actually farther) candidate — surface this
+                    // instead of hiding it.
+                    log(`  WARN  No station coordinates found for building_id ${v.building_id} (vehicle ${v.caption || v.id}) — excluded from nearest-vehicle comparison, not defaulted to [0,0]`);
+                    continue;
+                }
+                const [lat, lon] = coords;
                 const d = haversineKm(lat, lon, missionLat, missionLon);
                 if (d < bestDist) { bestDist = d; best = v; }
             }
