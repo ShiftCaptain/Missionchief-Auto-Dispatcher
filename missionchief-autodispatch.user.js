@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.23.2
+// @version      0.24.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -1185,6 +1185,19 @@
                     const alreadyAmb = ambTypes.reduce((s, t) => s + (assignedCounts[t] || 0), 0);
                     const stillNeededAmb = Math.max(0, patients - alreadyAmb);
                     for (let i = 0; i < stillNeededAmb; i++) slots.push(ambTypes);
+                }
+            }
+
+            // EMS Chief isn't a listed requirement anywhere in einsaetze.json —
+            // confirmed it's a dynamic rule instead: needed once a mission has
+            // 10+ patients. No fuzzy key-matching could ever catch this since
+            // there's no requirement key for it at all.
+            const EMS_CHIEF_PATIENT_THRESHOLD = 10;
+            if (patients >= EMS_CHIEF_PATIENT_THRESHOLD) {
+                const chiefTypes = state.links['ems chief'];
+                if (chiefTypes && chiefTypes.length) {
+                    const alreadyChief = chiefTypes.reduce((s, t) => s + (assignedCounts[t] || 0), 0);
+                    if (alreadyChief < 1) slots.push(chiefTypes);
                 }
             }
 
