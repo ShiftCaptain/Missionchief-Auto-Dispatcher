@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.23.1
+// @version      0.23.2
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -134,7 +134,7 @@
         "firetrucks": [0, 1, 30, 13, 18],
         "platform trucks": [2, 13],
         "wildland fire engines": [30, 31, 32, 33],
-        "battalion chief vehicles": [3, 12],
+        "battalion chief vehicles": [3],
         "heavy rescue vehicles": [4, 18, 8],
         "ambulance": [5, 27],
         "water tankers": [7],
@@ -1545,6 +1545,22 @@
                 log(`  One-time migration: narrowed "police cars" from [${before.join(', ')}] to [${after.join(', ')}] — K-9/SWAT no longer count as generic patrol cars.`);
             }
             GM_setValue('mc_links_migrated_v1', true);
+        }
+
+        // One-time migration: your stored "battalion chief vehicles" class
+        // previously included type 12 (Mobile Command Vehicles) alongside
+        // type 3 (actual Battalion Chiefs) — meaning a Command vehicle could
+        // wrongly satisfy a Battalion Chief requirement. Type 12 stays in its
+        // own "mobile command vehicles" class.
+        if (!GM_getValue('mc_links_migrated_v2', false) && Array.isArray(state.links['battalion chief vehicles'])) {
+            const before = state.links['battalion chief vehicles'];
+            const after = before.filter((t) => t !== 12);
+            if (after.length !== before.length) {
+                state.links['battalion chief vehicles'] = after;
+                setLinks(state.links);
+                log(`  One-time migration: narrowed "battalion chief vehicles" from [${before.join(', ')}] to [${after.join(', ')}] — Command vehicles no longer count as Battalion Chiefs.`);
+            }
+            GM_setValue('mc_links_migrated_v2', true);
         }
 
         // One-time migration: mission types cached before the fuzzy
