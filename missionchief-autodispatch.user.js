@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.25.0
+// @version      0.25.1
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -889,7 +889,7 @@
     // call — real accuracy for the decision that matters, bounded call count
     // for everything else. Falls back to the haversine ranking if OSRM calls
     // fail for any reason.
-    async function nearestVehicleForSlot(available, acceptableTypes, missionLat, missionLon, usedIds, buildingCoords, usedByMission) {
+    async function nearestVehicleForSlot(available, acceptableTypes, missionLat, missionLon, usedIds, buildingCoords, usedByMission, currentMissionName) {
         const ROUTE_RERANK_TOP_N = 30; // wide enough to cover large fleets (e.g. 50+ ambulances) without straight-line pre-filtering excluding the real road-distance winner
 
         const candidates = available.filter((v) => !usedIds.has(v.id) && acceptableTypes.includes(v.vehicle_type));
@@ -950,14 +950,18 @@
         // Cheap (haversine only, no extra OSRM calls) transparency check:
         // were any equivalent-type vehicles claimed by a DIFFERENT mission
         // earlier THIS SAME BATCH that looked closer than our actual winner?
-        // This turns "why didn't it use the obviously closer one" into a
-        // visible, explained outcome — real resource contention when
-        // multiple missions are active at once — instead of an unexplained
-        // mystery that looks like a selection bug.
+        // Explicitly excludes the CURRENT mission's own earlier picks — e.g.
+        // if this mission's own slot 1 already took the closest engine, that's
+        // not "contention" when filling slot 2, it's just this mission using
+        // its own vehicle. Only a genuinely different mission's claim counts.
         if (usedByMission) {
             const winnerDistForCompare = winner.routeKm ?? winner.dist;
             const claimedCloser = available
-                .filter((v) => usedIds.has(v.id) && acceptableTypes.includes(v.vehicle_type))
+                .filter((v) =>
+                    usedIds.has(v.id)
+                    && acceptableTypes.includes(v.vehicle_type)
+                    && usedByMission.get(v.id) !== currentMissionName
+                )
                 .map((v) => {
                     const coords = buildingCoords[v.building_id];
                     if (!coords) return null;
@@ -1251,7 +1255,7 @@
             const selectedNames = [];
             let unfilled = 0;
             for (const acceptableTypes of slots) {
-                const v = await nearestVehicleForSlot(available, acceptableTypes, mlat, mlon, usedIds, state.buildingCoords, usedByMission);
+                const v = await nearestVehicleForSlot(available, acceptableTypes, mlat, mlon, usedIds, state.buildingCoords, usedByMission, name);
                 if (!v) {
                     unfilled++;
                 } else {
