@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.24.1
+// @version      0.25.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -913,9 +913,17 @@
             return scored.sort((a, b) => a.dist - b.dist);
         }
 
-        const atStation = candidates.filter((v) => (v.fms_real ?? v.fms_show) === 1);
-        const usingAtStationOnly = atStation.length > 0;
-        const scored = haversineScoreOf(usingAtStationOnly ? atStation : candidates);
+        // Compare ALL available candidates (state 1 at-station and state 2
+        // returning) on equal footing by station-based distance. Previously
+        // this restricted to state-1-only whenever any existed, on the theory
+        // that a returning vehicle's station location was less trustworthy —
+        // but MissionChief's own dispatch panel does the exact same
+        // station-based approximation for every vehicle regardless of status
+        // (confirmed: multiple vehicles at one station all showed identical
+        // distance/time). There's no real position data for anyone to be
+        // more careful with, so refusing to consider state-2 candidates was
+        // just excluding real, often much closer, units for no actual gain.
+        const scored = haversineScoreOf(candidates);
         if (!scored.length) return null;
 
         // Re-rank the nearest few by real road distance.
@@ -935,9 +943,8 @@
             const others = finalOrder.slice(1, 4).map((s) =>
                 `${s.v.caption || s.v.id} (${allRouted ? s.routeKm.toFixed(1) + 'km road' : s.dist.toFixed(1) + 'km straight-line'})`
             ).join(', ');
-            const tierNote = usingAtStationOnly ? '' : ' [no confirmed at-station candidates — using approximate state-2 positions]';
             const winnerDist = allRouted ? `${winner.routeKm.toFixed(1)}km road` : `${winner.dist.toFixed(1)}km straight-line`;
-            log(`  PICK  ${winner.v.caption || winner.v.id} (${winnerDist})${tierNote} chosen over: ${others}${scored.length > ROUTE_RERANK_TOP_N ? ', ...' : ''}`);
+            log(`  PICK  ${winner.v.caption || winner.v.id} (${winnerDist}) chosen over: ${others}${scored.length > ROUTE_RERANK_TOP_N ? ', ...' : ''}`);
         }
 
         // Cheap (haversine only, no extra OSRM calls) transparency check:
