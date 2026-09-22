@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.24.0
+// @version      0.24.1
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -890,7 +890,7 @@
     // for everything else. Falls back to the haversine ranking if OSRM calls
     // fail for any reason.
     async function nearestVehicleForSlot(available, acceptableTypes, missionLat, missionLon, usedIds, buildingCoords, usedByMission) {
-        const ROUTE_RERANK_TOP_N = 15; // wide enough that straight-line pre-filtering rarely excludes the real road-distance winner
+        const ROUTE_RERANK_TOP_N = 30; // wide enough to cover large fleets (e.g. 50+ ambulances) without straight-line pre-filtering excluding the real road-distance winner
 
         const candidates = available.filter((v) => !usedIds.has(v.id) && acceptableTypes.includes(v.vehicle_type));
         if (!candidates.length) return null;
