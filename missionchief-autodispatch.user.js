@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.25.1
+// @version      0.27.1
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -514,13 +514,15 @@
 
             if (!(cls in links)) {
                 // Exact match failed — try substring matching in either
-                // direction (e.g. a raw key like "police_supervisor" or
-                // "ems_chief_units" should still connect to class names like
-                // "sheriff supervisor units" or "ems chief" without needing
-                // the exact wording to line up).
+                // direction, with punctuation normalized away first (e.g.
+                // "k-9 units" vs a raw key like "k9_units" -> "k9 units" would
+                // never match otherwise, since the hyphen makes them different
+                // strings even though they mean the same thing).
+                const normalize = (s) => s.replace(/[-_]/g, ' ').replace(/\s+/g, ' ').trim();
+                const clsNorm = normalize(cls);
                 const matched = linkKeys.find((k) => {
-                    const kLower = k.toLowerCase();
-                    return kLower.includes(cls) || cls.includes(kLower);
+                    const kNorm = normalize(k.toLowerCase());
+                    return kNorm.includes(clsNorm) || clsNorm.includes(kNorm);
                 });
                 if (matched) {
                     cls = matched;
@@ -840,34 +842,45 @@
     // Cached per coordinate pair (rounded) since the same station-to-mission
     // query repeats often within and across batches; OSRM's own response
     // also carries a 24h Cache-Control, so the browser cache helps too.
-    const routeDistanceCache = new Map(); // "lat1,lon1|lat2,lon2" -> { km, fetchedAt }
+    const routeInfoCache = new Map(); // "lat1,lon1|lat2,lon2" -> { km, seconds, fetchedAt }
     const ROUTE_CACHE_MS = 5 * 60 * 1000;
 
-    async function fetchRouteDistanceKm(lat1, lon1, lat2, lon2) {
+    // Confirmed via a real captured OSRM response:
+    // route_summary: { total_distance: 3478, total_time: 172, ... }
+    // (meters, seconds). MissionChief's own dispatch panel displays and
+    // almost certainly ranks by TIME ("00 min. 59 sec." etc.), not distance —
+    // a highway detour can be longer in km but faster in minutes than a
+    // direct back-road route, so ranking by distance could pick differently
+    // than the game itself would. This returns both; ranking uses seconds.
+    async function fetchRouteInfo(lat1, lon1, lat2, lon2) {
         const key = `${lat1.toFixed(4)},${lon1.toFixed(4)}|${lat2.toFixed(4)},${lon2.toFixed(4)}`;
-        const cached = routeDistanceCache.get(key);
-        if (cached && Date.now() - cached.fetchedAt < ROUTE_CACHE_MS) return cached.km;
+        const cached = routeInfoCache.get(key);
+        if (cached && Date.now() - cached.fetchedAt < ROUTE_CACHE_MS) return cached;
 
         try {
             const res = await fetch(`https://osrm.missionchief.com/viaroute?loc=${lat1},${lon1}&loc=${lat2},${lon2}`);
             if (!res.ok) return null;
             const data = await res.json();
-            // Defensive parsing — legacy OSRM v4 ("route_summary.total_distance"
-            // in meters) is what this endpoint's naming pattern suggests, but
-            // fall back to a couple of other plausible shapes just in case.
-            let meters = null;
-            if (data?.route_summary?.total_distance != null) {
-                meters = data.route_summary.total_distance;
-            } else if (data?.routes?.[0]?.distance != null) {
-                meters = data.routes[0].distance;
-            } else if (data?.total_distance != null) {
-                meters = data.total_distance;
-            }
-            if (meters == null) return null;
 
-            const km = meters / 1000;
-            routeDistanceCache.set(key, { km, fetchedAt: Date.now() });
-            return km;
+            let meters = null;
+            let seconds = null;
+            if (data?.route_summary) {
+                if (data.route_summary.total_distance != null) meters = data.route_summary.total_distance;
+                if (data.route_summary.total_time != null) seconds = data.route_summary.total_time;
+            } else if (data?.routes?.[0]) {
+                // Fallback for a possible modern OSRM v5+ shape, just in case.
+                if (data.routes[0].distance != null) meters = data.routes[0].distance;
+                if (data.routes[0].duration != null) seconds = data.routes[0].duration;
+            }
+            if (meters == null && seconds == null) return null;
+
+            const info = {
+                km: meters != null ? meters / 1000 : null,
+                seconds,
+                fetchedAt: Date.now(),
+            };
+            routeInfoCache.set(key, info);
+            return info;
         } catch (e) {
             return null;
         }
@@ -926,24 +939,31 @@
         const scored = haversineScoreOf(candidates);
         if (!scored.length) return null;
 
-        // Re-rank the nearest few by real road distance.
+        // Re-rank the nearest few by real route TIME — matches what the
+        // game's own dispatch panel displays and very likely sorts by.
         const shortlist = scored.slice(0, ROUTE_RERANK_TOP_N);
         const routed = await Promise.all(shortlist.map(async (s) => {
-            const routeKm = await fetchRouteDistanceKm(s.lat, s.lon, missionLat, missionLon);
-            return { ...s, routeKm };
+            const info = await fetchRouteInfo(s.lat, s.lon, missionLat, missionLon);
+            return { ...s, seconds: info?.seconds ?? null, km: info?.km ?? null };
         }));
 
-        const allRouted = routed.every((r) => r.routeKm != null);
+        const allRouted = routed.every((r) => r.seconds != null);
         const finalOrder = allRouted
-            ? [...routed].sort((a, b) => a.routeKm - b.routeKm)
+            ? [...routed].sort((a, b) => a.seconds - b.seconds)
             : routed; // fall back to the existing haversine order if any OSRM call failed
+
+        function fmtTime(sec) {
+            const m = Math.floor(sec / 60);
+            const s = Math.round(sec % 60);
+            return `${m}:${s.toString().padStart(2, '0')}`;
+        }
 
         const winner = finalOrder[0];
         if (finalOrder.length > 1) {
             const others = finalOrder.slice(1, 4).map((s) =>
-                `${s.v.caption || s.v.id} (${allRouted ? s.routeKm.toFixed(1) + 'km road' : s.dist.toFixed(1) + 'km straight-line'})`
+                `${s.v.caption || s.v.id} (${allRouted ? fmtTime(s.seconds) : s.dist.toFixed(1) + 'km straight-line'})`
             ).join(', ');
-            const winnerDist = allRouted ? `${winner.routeKm.toFixed(1)}km road` : `${winner.dist.toFixed(1)}km straight-line`;
+            const winnerDist = allRouted ? fmtTime(winner.seconds) : `${winner.dist.toFixed(1)}km straight-line`;
             log(`  PICK  ${winner.v.caption || winner.v.id} (${winnerDist}) chosen over: ${others}${scored.length > ROUTE_RERANK_TOP_N ? ', ...' : ''}`);
         }
 
@@ -955,7 +975,7 @@
         // not "contention" when filling slot 2, it's just this mission using
         // its own vehicle. Only a genuinely different mission's claim counts.
         if (usedByMission) {
-            const winnerDistForCompare = winner.routeKm ?? winner.dist;
+            const winnerDistForCompare = winner.km ?? winner.dist;
             const claimedCloser = available
                 .filter((v) =>
                     usedIds.has(v.id)
@@ -1587,6 +1607,20 @@
             GM_setValue('mc_links_migrated_v2', true);
         }
 
+        // One-time migration: confirmed the actual mission requirement
+        // terminology is "Water Tankers" — the earlier rename to "water
+        // tenders" was based on a wrong assumption (vehicle captions saying
+        // "Tender" is just this fleet's naming choice, not the game's
+        // requirement category). Renames back for anyone who updated between
+        // those two versions.
+        if (!GM_getValue('mc_links_migrated_v4', false) && Array.isArray(state.links['water tenders']) && !state.links['water tankers']) {
+            state.links['water tankers'] = state.links['water tenders'];
+            delete state.links['water tenders'];
+            setLinks(state.links);
+            log('  One-time migration: renamed "water tenders" back to "water tankers" — confirmed as the correct requirement terminology.');
+        }
+        GM_setValue('mc_links_migrated_v4', true);
+
         // One-time migration: mission types cached before the fuzzy
         // class-matching fix may be missing requirement lines that failed to
         // match back then (e.g. police supervisor / EMS chief units) and
@@ -1597,6 +1631,16 @@
             setMissionReqs({});
             GM_setValue('mc_cache_migrated_v2', true);
             log('  One-time migration: cleared cached mission requirements so they rebuild with improved class matching.');
+        }
+
+        // One-time migration: mission types cached before the punctuation-
+        // normalization fix (e.g. "k-9 units" failing to match "k9_units"
+        // due to the hyphen) or the water tankers -> water tenders rename
+        // may still be missing those requirement lines. Rebuild once more.
+        if (!GM_getValue('mc_cache_migrated_v3', false)) {
+            setMissionReqs({});
+            GM_setValue('mc_cache_migrated_v3', true);
+            log('  One-time migration: cleared cached mission requirements again for the punctuation-matching and water tender fixes.');
         }
 
         // One-time migration: reset reassignCloserUnits if it was previously
