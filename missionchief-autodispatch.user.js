@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.27.1
+// @version      0.28.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -514,14 +514,16 @@
 
             if (!(cls in links)) {
                 // Exact match failed — try substring matching in either
-                // direction, with punctuation normalized away first (e.g.
-                // "k-9 units" vs a raw key like "k9_units" -> "k9 units" would
-                // never match otherwise, since the hyphen makes them different
-                // strings even though they mean the same thing).
-                const normalize = (s) => s.replace(/[-_]/g, ' ').replace(/\s+/g, ' ').trim();
+                // direction, with ALL separators stripped entirely (not just
+                // converted to spaces — "k-9 units" -> "k 9 units" still
+                // wouldn't match "k9 units" since that leaves a stray space
+                // in a different place; stripping punctuation down to bare
+                // alphanumerics makes "k-9 units" and "k9_units" both become
+                // "k9units", guaranteed identical regardless of separator style).
+                const normalize = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
                 const clsNorm = normalize(cls);
                 const matched = linkKeys.find((k) => {
-                    const kNorm = normalize(k.toLowerCase());
+                    const kNorm = normalize(k);
                     return kNorm.includes(clsNorm) || clsNorm.includes(kNorm);
                 });
                 if (matched) {
@@ -579,8 +581,13 @@
         return hospitals;
     }
 
+    // Not confirmed via a real capture the way transportPrisoner was — but
+    // sd=d&sk=ac shows up on every single endpoint we've captured this whole
+    // conversation (dispatch, cancel, prisoner transport), so adding it here
+    // is a reasonable bet. If this still doesn't work, it needs its own
+    // Network capture the same way prisoner transport just got fixed.
     async function transportPatient(vehicleId, buildingId) {
-        const res = await fetch(`/vehicles/${vehicleId}/patient/${buildingId}`, { credentials: 'same-origin' });
+        const res = await fetch(`/vehicles/${vehicleId}/patient/${buildingId}?sd=d&sk=ac`, { credentials: 'same-origin' });
         return res.ok;
     }
 
@@ -645,8 +652,15 @@
         return prisons;
     }
 
+    // Confirmed via a live Network capture of a real prisoner transport
+    // click: the URL path was already right, but real requests carry this
+    // full query string. Missing it is the likely reason this "succeeded"
+    // (302 redirect, res.ok true) without actually performing the transport —
+    // same class of bug as the original dispatch issue, where matching the
+    // exact real request (not just the endpoint path) turned out to matter.
     async function transportPrisoner(vehicleId, buildingId) {
-        const res = await fetch(`/vehicles/${vehicleId}/gefangener/${buildingId}`, { credentials: 'same-origin' });
+        const params = 'sd=d&sk=ac&ift=sw&ifs=&ifp=&load_all_prisons=true&show_only_available=false';
+        const res = await fetch(`/vehicles/${vehicleId}/gefangener/${buildingId}?${params}`, { credentials: 'same-origin' });
         return res.ok;
     }
 
@@ -1641,6 +1655,16 @@
             setMissionReqs({});
             GM_setValue('mc_cache_migrated_v3', true);
             log('  One-time migration: cleared cached mission requirements again for the punctuation-matching and water tender fixes.');
+        }
+
+        // One-time migration: the previous punctuation-normalization fix
+        // (v3) was itself buggy — it converted hyphens to spaces instead of
+        // stripping them, so "k-9 units" still didn't match "k9_units". This
+        // version strips separators entirely instead. Rebuild once more.
+        if (!GM_getValue('mc_cache_migrated_v4', false)) {
+            setMissionReqs({});
+            GM_setValue('mc_cache_migrated_v4', true);
+            log('  One-time migration: cleared cached mission requirements again — the previous punctuation fix had its own bug, now corrected.');
         }
 
         // One-time migration: reset reassignCloserUnits if it was previously
