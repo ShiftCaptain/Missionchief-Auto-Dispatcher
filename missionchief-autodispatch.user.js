@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.30.1
+// @version      0.30.2
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -591,19 +591,19 @@
         return res.ok;
     }
 
-    // Confirmed via live investigation of a real prisoner-transport case:
-    // fms_real === 5 was never a verified trigger — it was an untested
-    // assumption from the original Python bot. The real signal is: on scene
-    // (fms_real === 4) at a mission whose OWN data shows patients/prisoners
-    // still waiting. No per-vehicle field distinguishes "holding a patient"
-    // from any other on-scene status; it has to be read from the mission.
+    // NOTE: fms_real === 5 was the ORIGINAL working trigger for patient
+    // transport, inherited from the Python bot. When fms_real === 4 was
+    // confirmed as the real trigger for PRISONER transport (via a live
+    // screenshot), that fix was generalized onto patients too WITHOUT actual
+    // confirmation ambulances behave the same way — that assumption broke
+    // working patient transport. Reverted back to the original, since
+    // ambulances likely use a genuinely different status for "loaded and
+    // ready to transport" than police cars do for "holding a prisoner."
     async function runTransportPass(vehicles, missionsById) {
         let transportCount = 0;
         for (const v of vehicles) {
             if (!isRunning) break;
-            if (v.fms_real !== 4 || v.target_type !== 'mission') continue;
-            const mission = missionsById.get(v.target_id);
-            if (!mission || !(mission.patients_count > 0)) continue;
+            if (v.fms_real !== 5) continue;
 
             const vid = v.id;
             const vname = v.caption || `Vehicle ${vid}`;
