@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.30.0
+// @version      0.30.1
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -1276,7 +1276,12 @@
                     const alreadyTransports = transportTypes.reduce((s, t) => s + (assignedCounts[t] || 0), 0);
                     const capacityCovered = alreadyTransports * TRANSPORT_CAPACITY;
                     const stillNeededCapacity = Math.max(0, prisoners - capacityCovered);
-                    const neededTransports = Math.ceil(stillNeededCapacity / TRANSPORT_CAPACITY);
+                    // floor, not ceil — a van should only dispatch for a FULL
+                    // load (5, 10, 15...). Smaller leftover counts (1-4) rely
+                    // on individual police cars via the existing transport
+                    // pass instead of wastefully sending a 5-capacity van for
+                    // just 1 prisoner.
+                    const neededTransports = Math.floor(stillNeededCapacity / TRANSPORT_CAPACITY);
                     for (let i = 0; i < neededTransports; i++) slots.push(transportTypes);
                 }
             }
