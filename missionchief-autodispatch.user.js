@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MissionChief Auto-Dispatch v2
 // @namespace    shiftcaptain.missionchief
-// @version      0.28.0
+// @version      0.30.0
 // @description  Delta-based auto-dispatch (tops up partial/upgraded missions instead of abandoning them). Runs in-tab, no login handling needed.
 // @match        https://www.missionchief.com/*
 // @match        https://*.missionchief.com/*
@@ -591,11 +591,20 @@
         return res.ok;
     }
 
-    async function runTransportPass(vehicles) {
+    // Confirmed via live investigation of a real prisoner-transport case:
+    // fms_real === 5 was never a verified trigger — it was an untested
+    // assumption from the original Python bot. The real signal is: on scene
+    // (fms_real === 4) at a mission whose OWN data shows patients/prisoners
+    // still waiting. No per-vehicle field distinguishes "holding a patient"
+    // from any other on-scene status; it has to be read from the mission.
+    async function runTransportPass(vehicles, missionsById) {
         let transportCount = 0;
         for (const v of vehicles) {
             if (!isRunning) break;
-            if (v.fms_real !== 5) continue;
+            if (v.fms_real !== 4 || v.target_type !== 'mission') continue;
+            const mission = missionsById.get(v.target_id);
+            if (!mission || !(mission.patients_count > 0)) continue;
+
             const vid = v.id;
             const vname = v.caption || `Vehicle ${vid}`;
 
@@ -743,11 +752,19 @@
         return false;
     }
 
-    async function runPrisonerTransportPass(vehicles) {
+    // Confirmed via live investigation of a real case: a vehicle on scene
+    // (fms_real === 4) holding a prisoner had NO distinguishing per-vehicle
+    // field at all — the only real signal is the mission's own
+    // prisoners_count. fms_real === 5 (the original assumption from the
+    // Python bot) was never actually verified and is now known wrong.
+    async function runPrisonerTransportPass(vehicles, missionsById) {
         let transportCount = 0;
         for (const v of vehicles) {
             if (!isRunning) break;
-            if (v.fms_real !== 5) continue;
+            if (v.fms_real !== 4 || v.target_type !== 'mission') continue;
+            const mission = missionsById.get(v.target_id);
+            if (!mission || !(mission.prisoners_count > 0)) continue;
+
             const vid = v.id;
             const vname = v.caption || `Vehicle ${vid}`;
 
@@ -1246,6 +1263,24 @@
                 }
             }
 
+            // Prisoner transport: not a listed requirement either — dynamic,
+            // driven by mission.prisoners_count, same pattern as ambulances.
+            // A dedicated transport van carries 5 at once vs. a plain police
+            // car's 1, so this computes how many vans are needed by capacity
+            // rather than one vehicle per prisoner.
+            const prisoners = mission.prisoners_count || 0;
+            if (prisoners > 0) {
+                const transportTypes = state.links['prisoner transport'];
+                if (transportTypes && transportTypes.length) {
+                    const TRANSPORT_CAPACITY = 5;
+                    const alreadyTransports = transportTypes.reduce((s, t) => s + (assignedCounts[t] || 0), 0);
+                    const capacityCovered = alreadyTransports * TRANSPORT_CAPACITY;
+                    const stillNeededCapacity = Math.max(0, prisoners - capacityCovered);
+                    const neededTransports = Math.ceil(stillNeededCapacity / TRANSPORT_CAPACITY);
+                    for (let i = 0; i < neededTransports; i++) slots.push(transportTypes);
+                }
+            }
+
             // Personnel certifications & resources (water, foam, etc.): both
             // verified against real per-vehicle data scraped from the vehicle
             // detail page (crew Training table, and "{X} amount" capacity
@@ -1261,7 +1296,7 @@
             const hasResourceNeed = otherNeeds.length > 0;
 
             const totalRequired = (entry.requirements || []).reduce((s, r) => s + parseInt(r.qty, 10), 0);
-            if (totalRequired === 0 && !patients && !hasPersonnelNeed && !hasResourceNeed) {
+            if (totalRequired === 0 && !patients && !prisoners && !hasPersonnelNeed && !hasResourceNeed) {
                 // No-requirement mission type — dispatch empty once.
                 // vehicle_state is safe to use ONLY here as a one-time marker,
                 // since there's nothing to ever top up on a no-req mission.
@@ -1689,10 +1724,11 @@
             if (!isRunning) break;
             try {
                 setTimerText('Running transport passes...');
-                const freshVehicles = await fetchVehicles();
-                await runTransportPass(freshVehicles);
+                const [freshVehicles, freshMissions] = await Promise.all([fetchVehicles(), fetchMissions()]);
+                const missionsById = new Map(freshMissions.map((m) => [m.id, m]));
+                await runTransportPass(freshVehicles, missionsById);
                 if (!isRunning) break;
-                await runPrisonerTransportPass(freshVehicles);
+                await runPrisonerTransportPass(freshVehicles, missionsById);
             } catch (e) {
                 log(`Network error during transport pass: ${e.message}`);
             }
